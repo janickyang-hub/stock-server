@@ -21,12 +21,11 @@ def get_kis_token() -> str:
         _token_cache["expires_at"] and
         now < _token_cache["expires_at"]):
         return _token_cache["access_token"]
-    url  = f"{KIS_BASE_URL}/oauth2/tokenP"
-    body = {"grant_type": "client_credentials",
-            "appkey": KIS_APP_KEY, "appsecret": KIS_APP_SECRET}
-    res  = requests.post(url, json=body, timeout=10)
-    data = res.json()
-    token = data.get("access_token", "")
+    res  = requests.post(f"{KIS_BASE_URL}/oauth2/tokenP",
+                         json={"grant_type": "client_credentials",
+                               "appkey": KIS_APP_KEY,
+                               "appsecret": KIS_APP_SECRET}, timeout=10)
+    token = res.json().get("access_token", "")
     if token:
         _token_cache["access_token"] = token
         _token_cache["expires_at"]   = now + timedelta(hours=23)
@@ -52,7 +51,7 @@ def krx_post(endpoint: str, params: dict) -> list:
             return []
         return res.json().get("OutBlock_1", [])
     except Exception as e:
-        print(f"[ERROR] KRX {endpoint}: {e}")
+        print(f"[ERROR] KRX: {e}")
         return []
 
 def latest_biz_day() -> str:
@@ -83,61 +82,103 @@ def cap_size(mkt_cap: float) -> str:
     if mkt_cap >= 300_000_000_000:   return "mid"
     return "small"
 
-# MARK: - KIS 주식현재가 시세 (PER, PBR, 배당수익률)
-def kis_get_stock_detail(stock_code: str) -> dict:
-    url = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
-    params = {
-        "FID_COND_MRKT_DIV_CODE": "J",
-        "FID_INPUT_ISCD": stock_code
+# MARK: - KIS API: 종목 투자지표 조회
+# FHKST01010100: 주식현재가 시세 → PER, PBR, EPS, BPS
+# FHKST01010200: 주식현재가 기본시세 → 배당수익률(dvdy_rate), 주당배당금(divi)
+def kis_get_indicators(stock_code: str) -> dict:
+    base_url = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations"
+    params   = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": stock_code}
+
+    # 1. PER, PBR, EPS, BPS
+    try:
+        r1     = requests.get(f"{base_url}/inquire-price",
+                              headers=kis_headers("FHKST01010100"),
+                              params=params, timeout=10)
+        o1     = r1.json().get("output", {})
+        per    = safe_float(o1.get("per", 0))
+        pbr    = safe_float(o1.get("pbr", 0))
+        eps    = safe_float(o1.get("eps", 0))
+        bps    = safe_float(o1.get("bps", 0))
+    except:
+        per = pbr = eps = bps = 0.0
+
+    # 2. 배당수익률, 주당배당금 (기본시세 API)
+    try:
+        r2       = requests.get(f"{base_url}/inquire-daily-price",
+                                headers=kis_headers("FHKST01010400"),
+                                params={**params,
+                                        "FID_PERIOD_DIV_CODE": "D",
+                                        "FID_ORG_ADJ_PRC":     "0"}, timeout=10)
+        o2       = r2.json().get("output2", [{}])
+        # 배당 정보는 종목 기본 정보 API에서 가져오기
+        r3       = requests.get(f"{base_url}/inquire-price",
+                                headers=kis_headers("FHKST01010100"),
+                                params=params, timeout=10)
+        o3       = r3.json().get("output", {})
+        # 기본시세에서 배당수익률 필드 탐색
+        div_yield = safe_float(o3.get("dvdy_rate",  # 배당수익률
+                               o3.get("bps_dvdy_rate",
+                               o3.get("stck_dvdy_rate", 0))))
+        dps       = safe_float(o3.get("divi", o3.get("per_sto_divi_amt", 0)))
+    except:
+        div_yield = dps = 0.0
+
+    # 배당성향 = DPS / EPS * 100
+    div_payout = round(dps / eps * 100, 2) if eps > 0 and dps > 0 else 0.0
+
+    return {
+        "per":       per,
+        "pbr":       pbr,
+        "eps":       eps,
+        "bps":       bps,
+        "div_yield": div_yield,
+        "dps":       dps,
+        "div_payout": div_payout
     }
-    try:
-        res    = requests.get(url, headers=kis_headers("FHKST01010100"),
-                              params=params, timeout=10)
-        output = res.json().get("output", {})
-        return {
-            "per":       safe_float(output.get("per",       0)),
-            "pbr":       safe_float(output.get("pbr",       0)),
-            "eps":       safe_float(output.get("eps",       0)),
-            "bps":       safe_float(output.get("bps",       0)),
-            "div_yield": safe_float(output.get("dvdy_rate", 0)),  # 배당수익률
-            "dps":       safe_float(output.get("divi",      0)),  # 주당배당금
-        }
-    except Exception as e:
-        print(f"[ERROR] KIS {stock_code}: {e}")
-        return {"per": 0, "pbr": 0, "eps": 0, "bps": 0, "div_yield": 0, "dps": 0}
 
-# MARK: - 전체 응답 필드 확인용
-@app.route("/test_kis")
-def test_kis():
-    try:
-        token = get_kis_token()
-        if not token:
-            return jsonify({"error": "토큰 발급 실패"})
+# MARK: - 배당 필드 탐색용 디버그 엔드포인트
+@app.route("/test_div")
+def test_div():
+    """삼성전자 전체 응답에서 배당 관련 필드 확인"""
+    token = get_kis_token()
+    if not token:
+        return jsonify({"error": "토큰 발급 실패"})
 
-        # 삼성전자 전체 응답 필드 확인
-        url    = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
-        params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": "005930"}
-        res    = requests.get(url, headers=kis_headers("FHKST01010100"),
-                              params=params, timeout=10)
-        data   = res.json()
-        output = data.get("output", {})
+    results = {}
+    base_url = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations"
+    params   = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": "005930"}
 
-        # 배당/PER/PBR 관련 필드만 필터링
-        finance_fields = {k: v for k, v in output.items()
-                          if any(kw in k.lower() for kw in
-                                 ["per", "pbr", "eps", "bps", "div", "divi",
-                                  "dvdy", "yield", "rate", "stac"])}
+    # 여러 TR_ID 시도해서 배당 필드 탐색
+    for tr_id, path, extra in [
+        ("FHKST01010100", "inquire-price",          {}),
+        ("FHKST01010200", "inquire-member",          {}),
+        ("FHKST11300006", "inquire-daily-itemchartprice",
+         {"FID_PERIOD_DIV_CODE": "D", "FID_ORG_ADJ_PRC": "0",
+          "FID_INPUT_DATE_1": "20260101", "FID_INPUT_DATE_2": "20260317"}),
+    ]:
+        try:
+            r = requests.get(f"{base_url}/{path}",
+                             headers=kis_headers(tr_id),
+                             params={**params, **extra}, timeout=10)
+            data   = r.json()
+            output = data.get("output", data.get("output1", {}))
+            if isinstance(output, list):
+                output = output[0] if output else {}
+            # 배당 관련 키 필터링
+            div_keys = {k: v for k, v in output.items()
+                        if any(kw in k.lower()
+                               for kw in ["div", "divi", "dvdy", "yield", "dps"])}
+            results[tr_id] = {
+                "div_keys":  div_keys,
+                "all_keys":  list(output.keys()),
+                "rt_cd":     data.get("rt_cd"),
+                "msg":       data.get("msg1", "")
+            }
+        except Exception as e:
+            results[tr_id] = {"error": str(e)}
 
-        return jsonify({
-            "token_ok":       True,
-            "finance_fields": finance_fields,   # 재무 관련 필드 전체
-            "all_keys":       list(output.keys())  # 전체 키 목록
-        })
-    except Exception as e:
-        import traceback
-        return jsonify({"error": str(e), "trace": traceback.format_exc()})
+    return jsonify(results)
 
-# MARK: - 메인 엔드포인트
 @app.route("/stocks")
 def stocks():
     try:
@@ -153,8 +194,8 @@ def stocks():
 
         all_items = []
         for item in kospi + kosdaq:
-            isu_cd   = item.get("ISU_CD", "")
-            name     = item.get("ISU_NM", "").strip()
+            isu_cd  = item.get("ISU_CD", "")
+            name    = item.get("ISU_NM", "").strip()
             if not isu_cd or not name:
                 continue
             short_cd = to_short_code(isu_cd)
@@ -172,12 +213,7 @@ def stocks():
 
         result = []
         for i, item in enumerate(top_items):
-            detail     = kis_get_stock_detail(item["id"])
-            eps        = detail.get("eps", 0)
-            dps        = detail.get("dps", 0)
-            div_yield  = detail.get("div_yield", 0)
-            div_payout = round(dps / eps * 100, 2) if eps > 0 else 0.0
-
+            ind = kis_get_indicators(item["id"])
             result.append({
                 "id":        item["id"],
                 "name":      item["name"],
@@ -185,14 +221,12 @@ def stocks():
                 "change":    item["change"],
                 "marketCap": item["marketCap"],
                 "capSize":   item["capSize"],
-                "per":       detail.get("per", 0),
-                "pbr":       detail.get("pbr", 0),
-                "divYield":  div_yield,
-                "divAmount": int(dps),
-                "divPayout": div_payout
+                "per":       ind["per"],
+                "pbr":       ind["pbr"],
+                "divYield":  ind["div_yield"],
+                "divAmount": int(ind["dps"]),
+                "divPayout": ind["div_payout"]
             })
-
-            # KIS API 초당 20회 제한 방지
             if (i + 1) % 18 == 0:
                 time.sleep(1)
 
@@ -201,9 +235,7 @@ def stocks():
 
     except Exception as e:
         import traceback
-        tb = traceback.format_exc()
-        print(f"[ERROR] {tb}")
-        return jsonify({"error": str(e), "trace": tb}), 500
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 @app.route("/health")
 def health():
