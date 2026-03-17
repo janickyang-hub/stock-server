@@ -1,9 +1,8 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 import requests
 import os
 from datetime import datetime, timedelta
 import pytz
-from pykrx import stock as pykrx_stock
 
 app = Flask(__name__)
 
@@ -55,39 +54,34 @@ def cap_size(mkt_cap: float) -> str:
     return "small"
 
 def fetch_pykrx_indicators(date: str) -> dict:
-    """pykrx로 전종목 PER/PBR/EPS/BPS/배당수익률/주당배당금 가져오기"""
-    ind_map = {}
+    """pykrx로 전종목 PER/PBR/배당 가져오기"""
     try:
-        # KOSPI 투자지표
-        df_kospi = pykrx_stock.get_market_fundamental(date, market="KOSPI")
-        for ticker, row in df_kospi.iterrows():
-            ind_map[ticker] = {
-                "PER":     float(row.get("PER", 0) or 0),
-                "PBR":     float(row.get("PBR", 0) or 0),
-                "EPS":     float(row.get("EPS", 0) or 0),
-                "BPS":     float(row.get("BPS", 0) or 0),
-                "DIV":     float(row.get("DIV", 0) or 0),   # 배당수익률(%)
-                "DPS":     float(row.get("DPS", 0) or 0),   # 주당배당금
-            }
-        print(f"[DEBUG] pykrx KOSPI 투자지표: {len(df_kospi)}개")
+        from pykrx import stock as pykrx_stock
+        ind_map = {}
 
-        # KOSDAQ 투자지표
-        df_kosdaq = pykrx_stock.get_market_fundamental(date, market="KOSDAQ")
-        for ticker, row in df_kosdaq.iterrows():
-            ind_map[ticker] = {
-                "PER":     float(row.get("PER", 0) or 0),
-                "PBR":     float(row.get("PBR", 0) or 0),
-                "EPS":     float(row.get("EPS", 0) or 0),
-                "BPS":     float(row.get("BPS", 0) or 0),
-                "DIV":     float(row.get("DIV", 0) or 0),
-                "DPS":     float(row.get("DPS", 0) or 0),
-            }
-        print(f"[DEBUG] pykrx KOSDAQ 투자지표: {len(df_kosdaq)}개")
+        for market in ["KOSPI", "KOSDAQ"]:
+            try:
+                df = pykrx_stock.get_market_fundamental(date, market=market)
+                print(f"[DEBUG] pykrx {market} shape={df.shape} columns={list(df.columns)}")
+                if df.empty:
+                    print(f"[WARN] pykrx {market} 빈 데이터 - 날짜 {date} 확인 필요")
+                    continue
+                for ticker, row in df.iterrows():
+                    ind_map[str(ticker)] = {
+                        "PER": float(row.get("PER", 0) or 0),
+                        "PBR": float(row.get("PBR", 0) or 0),
+                        "EPS": float(row.get("EPS", 0) or 0),
+                        "BPS": float(row.get("BPS", 0) or 0),
+                        "DIV": float(row.get("DIV", 0) or 0),
+                        "DPS": float(row.get("DPS", 0) or 0),
+                    }
+            except Exception as e:
+                print(f"[ERROR] pykrx {market}: {e}")
 
+        return ind_map
     except Exception as e:
-        print(f"[ERROR] pykrx 투자지표: {e}")
-
-    return ind_map
+        print(f"[ERROR] pykrx import 또는 실행 오류: {e}")
+        return {}
 
 @app.route("/stocks")
 def stocks():
@@ -95,7 +89,6 @@ def stocks():
         base_date = latest_biz_day()
         print(f"[DEBUG] 기준일: {base_date}")
 
-        # 1. KRX Open API: KOSPI + KOSDAQ 시세
         kospi  = krx_post("sto/stk_bydd_trd", {"basDd": base_date})
         kosdaq = krx_post("sto/ksq_bydd_trd", {"basDd": base_date})
         print(f"[DEBUG] KOSPI={len(kospi)} KOSDAQ={len(kosdaq)}")
@@ -103,29 +96,26 @@ def stocks():
         if not kospi and not kosdaq:
             return jsonify({"error": "KRX 시세 API 응답 없음", "date": base_date}), 500
 
-        # 2. pykrx: 전종목 PER/PBR/배당수익률/주당배당금
         ind_map = fetch_pykrx_indicators(base_date)
         print(f"[DEBUG] 투자지표 총 {len(ind_map)}개")
 
         result = []
         for item in kospi + kosdaq:
-            isu_cd   = item.get("ISU_CD", "")
-            name     = item.get("ISU_NM", "").strip()
+            isu_cd = item.get("ISU_CD", "")
+            name   = item.get("ISU_NM", "").strip()
             if not isu_cd or not name:
                 continue
 
-            short_cd  = to_short_code(isu_cd)
-            price     = safe_float(item.get("TDD_CLSPRC", 0))
-            mkt_cap   = safe_float(item.get("MKTCAP",     0))
-            change    = safe_float(item.get("FLUC_RT",    0))
-
-            ind       = ind_map.get(short_cd, {})
-            per       = ind.get("PER", 0)
-            pbr       = ind.get("PBR", 0)
-            eps       = ind.get("EPS", 0)
-            dps       = ind.get("DPS", 0)   # 주당배당금
-            div_yld   = ind.get("DIV", 0)   # 배당수익률(%)
-            # 배당성향 = 주당배당금 / EPS * 100
+            short_cd   = to_short_code(isu_cd)
+            price      = safe_float(item.get("TDD_CLSPRC", 0))
+            mkt_cap    = safe_float(item.get("MKTCAP",     0))
+            change     = safe_float(item.get("FLUC_RT",    0))
+            ind        = ind_map.get(short_cd, {})
+            per        = ind.get("PER", 0)
+            pbr        = ind.get("PBR", 0)
+            eps        = ind.get("EPS", 0)
+            dps        = ind.get("DPS", 0)
+            div_yld    = ind.get("DIV", 0)
             div_payout = round(dps / eps * 100, 2) if eps > 0 else 0.0
 
             result.append({
@@ -154,12 +144,12 @@ def stocks():
 
 @app.route("/test_ind")
 def test_ind():
-    """투자지표 확인용"""
-    base_date = latest_biz_day()
-    ind_map   = fetch_pykrx_indicators(base_date)
-    sample    = dict(list(ind_map.items())[:3])
+    """날짜를 직접 지정해서 테스트 가능: /test_ind?date=20260313"""
+    date    = request.args.get("date", latest_biz_day())
+    ind_map = fetch_pykrx_indicators(date)
+    sample  = dict(list(ind_map.items())[:3])
     return jsonify({
-        "date":   base_date,
+        "date":   date,
         "count":  len(ind_map),
         "sample": sample
     })
