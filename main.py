@@ -144,15 +144,22 @@ def stocks():
 
 @app.route("/test_ind")
 def test_ind():
-    """날짜를 직접 지정해서 테스트 가능: /test_ind?date=20260313"""
-    date    = request.args.get("date", latest_biz_day())
-    ind_map = fetch_pykrx_indicators(date)
-    sample  = dict(list(ind_map.items())[:3])
-    return jsonify({
-        "date":   date,
-        "count":  len(ind_map),
-        "sample": sample
-    })
+    date = request.args.get("date", "20260313")
+    try:
+        from pykrx import stock as pykrx_stock
+        df = pykrx_stock.get_market_fundamental(date, market="KOSPI")
+        return jsonify({
+            "date":       date,
+            "shape":      str(df.shape),
+            "columns":    list(df.columns),      # 실제 컬럼명 확인
+            "index_name": str(df.index.name),    # 인덱스 이름
+            "empty":      df.empty,
+            "count":      len(df),
+            "raw_sample": df.head(3).to_dict()   # 원본 데이터 구조 그대로
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()})
 
 @app.route("/health")
 def health():
