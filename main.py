@@ -30,6 +30,9 @@ def get_kis_token() -> str:
     if token:
         _token_cache["access_token"] = token
         _token_cache["expires_at"]   = now + timedelta(hours=23)
+        print("[DEBUG] KIS 토큰 발급 성공")
+    else:
+        print(f"[ERROR] KIS 토큰 발급 실패: {res.text[:200]}")
     return token
 
 def kis_headers(tr_id: str) -> dict:
@@ -85,16 +88,13 @@ def cap_size(mkt_cap: float) -> str:
 
 # =============================================
 # 공공데이터포털 배당 API
-# basDt는 특정 날짜(YYYYMMDD) — 연도만 입력 불가
-# 전년도 12월 31일 기준으로 조회 (대부분 12월 결산법인)
+# 전년도 배당 데이터 전체 조회
 # =============================================
 def fetch_dividend_map() -> dict:
     div_map = {}
     try:
-        # 전년도 12월 31일 기준 (12월 결산법인 배당기준일)
-        tz       = pytz.timezone("Asia/Seoul")
-        prev_yr  = datetime.now(tz).year - 1
-        base_dt  = f"{prev_yr}1231"
+        tz      = pytz.timezone("Asia/Seoul")
+        prev_yr = datetime.now(tz).year - 1
 
         url  = "https://apis.data.go.kr/1160100/service/GetStocDiviInfoService/getDiviInfo"
         page = 1
@@ -104,37 +104,51 @@ def fetch_dividend_map() -> dict:
                 "numOfRows":   "1000",
                 "pageNo":      str(page),
                 "resultType":  "json",
-                "basDt":       base_dt,
+                "beginBasDt":  f"{prev_yr}0101",  # 전년도 1월 1일
+                "endBasDt":    f"{prev_yr}1231",   # 전년도 12월 31일
             }
             res  = requests.get(url, params=params, timeout=20)
-            print(f"[DEBUG] 배당 API status={res.status_code} body={res.text[:200]}")
-            data = res.json()
+            print(f"[DEBUG] 배당 API page={page} status={res.status_code}")
+
+            if res.status_code != 200:
+                print(f"[ERROR] 배당 API 응답: {res.text[:200]}")
+                break
+
+            data  = res.json()
             items = (data.get("response", {})
                          .get("body", {})
                          .get("items", {})
                          .get("item", []))
+
             if not items:
                 break
+
             for item in items:
+                # 보통주만 처리
                 if item.get("scrsItmsKcd", "") != "0101":
                     continue
-                isin = item.get("isinCd", "")
-                if len(isin) == 12 and isin.startswith("KR"):
-                    code    = isin[3:9]
-                    div_amt = safe_float(item.get("stckGenrDvdnAmt", 0))
-                    div_rt  = safe_float(item.get("stckGenrCashDvdnRt", 0))
-                    if div_amt > 0:
+                isin    = item.get("isinCd", "")
+                div_amt = safe_float(item.get("stckGenrDvdnAmt", 0))
+                if len(isin) == 12 and isin.startswith("KR") and div_amt > 0:
+                    code = isin[3:9]
+                    # 같은 종목이 여러 번 나오면 가장 최근 배당기준일 데이터로 덮어쓰기
+                    existing = div_map.get(code)
+                    new_date = item.get("dvdnBasDt", "")
+                    if not existing or new_date > existing.get("dvdnBasDt", ""):
                         div_map[code] = {
-                            "divAmount": int(div_amt),
-                            "divRate":   div_rt,
+                            "divAmount":  int(div_amt),
+                            "dvdnBasDt":  new_date,
                         }
+
             total = int(data.get("response", {})
                             .get("body", {})
                             .get("totalCount", 0))
             print(f"[DEBUG] 배당 page={page} total={total} items={len(items)}")
+
             if page * 1000 >= total:
                 break
             page += 1
+
         print(f"[DEBUG] 배당 데이터: {len(div_map)}개 종목")
     except Exception as e:
         import traceback
@@ -155,15 +169,19 @@ def kis_get_per_pbr(stock_code: str) -> dict:
             "bps": safe_float(output.get("bps", 0)),
         }
     except Exception as e:
-        print(f"[ERROR] KIS PER/PBR {stock_code}: {e}")
+        print(f"[ERROR] KIS {stock_code}: {e}")
         return {"per": 0, "pbr": 0, "eps": 0, "bps": 0}
 
+# =============================================
+# 메인 엔드포인트
+# =============================================
 @app.route("/stocks")
 def stocks():
     try:
         base_date = latest_biz_day()
         print(f"[DEBUG] 기준일: {base_date}")
 
+        # 1. KRX: 전종목 시세
         kospi  = krx_post("sto/stk_bydd_trd", {"basDd": base_date})
         kosdaq = krx_post("sto/ksq_bydd_trd", {"basDd": base_date})
         print(f"[DEBUG] KRX KOSPI={len(kospi)} KOSDAQ={len(kosdaq)}")
@@ -171,12 +189,14 @@ def stocks():
         if not kospi and not kosdaq:
             return jsonify({"error": "KRX 시세 API 응답 없음", "date": base_date}), 500
 
+        # 2. 배당 데이터 일괄 조회
         div_map = fetch_dividend_map()
 
+        # 3. 시가총액 기준 정렬 후 상위 2000개
         all_items = []
         for item in kospi + kosdaq:
-            isu_cd   = item.get("ISU_CD", "")
-            name     = item.get("ISU_NM", "").strip()
+            isu_cd  = item.get("ISU_CD", "")
+            name    = item.get("ISU_NM", "").strip()
             if not isu_cd or not name:
                 continue
             short_cd = to_short_code(isu_cd)
@@ -192,6 +212,7 @@ def stocks():
         all_items.sort(key=lambda x: x["marketCap"], reverse=True)
         top_items = all_items[:2000]
 
+        # 4. KIS: PER/PBR + 배당 결합
         result = []
         for i, item in enumerate(top_items):
             ind        = kis_get_per_pbr(item["id"])
@@ -216,6 +237,7 @@ def stocks():
                 "divPayout": div_payout
             })
 
+            # KIS API 초당 20회 제한 방지
             if (i + 1) % 18 == 0:
                 time.sleep(1)
 
@@ -226,6 +248,9 @@ def stocks():
         import traceback
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
+# =============================================
+# 테스트 엔드포인트
+# =============================================
 @app.route("/test_div")
 def test_div():
     div_map = fetch_dividend_map()
