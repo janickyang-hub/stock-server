@@ -6,7 +6,7 @@ import pytz
 app = Flask(__name__)
 
 # KRX Open API 인증키 - 발급받은 키로 교체하세요
-KRX_AUTH_KEY = "여기에_KRX_인증키_입력"
+KRX_AUTH_KEY = "C1421182F8FD42CA999E3F73D51D0DF2C3829272"
 
 BASE_URL = "https://openapi.krx.co.kr/contents/OPP/USES/service"
 
