@@ -9,6 +9,23 @@ app = Flask(__name__)
 KRX_AUTH_KEY = "C1421182F8FD42CA999E3F73D51D0DF2C3829272"
 KRX_BASE     = "https://data-dbg.krx.co.kr/svc/apis"
 
+def krx_post(endpoint: str, params: dict) -> list:
+    url     = f"{KRX_BASE}/{endpoint}"
+    headers = {
+        "AUTH_KEY":     KRX_AUTH_KEY,
+        "Content-Type": "application/json; charset=UTF-8"
+    }
+    try:
+        res = requests.post(url, headers=headers, json=params, timeout=20)
+        print(f"[DEBUG] {endpoint} status={res.status_code} len={len(res.text)}")
+        if res.status_code != 200:
+            print(f"[ERROR] body={res.text[:300]}")
+            return []
+        return res.json().get("OutBlock_1", [])
+    except Exception as e:
+        print(f"[ERROR] {endpoint}: {e}")
+        return []
+
 def latest_biz_day() -> str:
     tz   = pytz.timezone("Asia/Seoul")
     now  = datetime.now(tz)
@@ -37,63 +54,40 @@ def cap_size(mkt_cap: float) -> str:
     if mkt_cap >= 300_000_000_000:   return "mid"
     return "small"
 
-# MARK: - 진단용 엔드포인트 (KRX 실제 응답 그대로 반환)
-@app.route("/test")
-def test():
-    base_date = latest_biz_day()
-    url       = f"{KRX_BASE}/sto/stk_bydd_trd"
-    headers   = {
-        "AUTH_KEY":     KRX_AUTH_KEY,
-        "Content-Type": "application/json; charset=UTF-8"
-    }
-    try:
-        res = requests.post(url, headers=headers,
-                            json={"basDd": base_date}, timeout=20)
-        return jsonify({
-            "url":        url,
-            "date":       base_date,
-            "auth_key":   KRX_AUTH_KEY[:8] + "...",  # 앞 8자리만 표시
-            "status":     res.status_code,
-            "headers":    dict(res.headers),
-            "body":       res.text[:1000]             # 응답 앞 1000자
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)})
-
 @app.route("/stocks")
 def stocks():
     try:
         base_date = latest_biz_day()
+        print(f"[DEBUG] 기준일: {base_date}")
 
-        headers = {
-            "AUTH_KEY":     KRX_AUTH_KEY,
-            "Content-Type": "application/json; charset=UTF-8"
-        }
-
-        kospi_res  = requests.post(f"{KRX_BASE}/sto/stk_bydd_trd",
-                                   headers=headers,
-                                   json={"basDd": base_date}, timeout=20)
-        kosdaq_res = requests.post(f"{KRX_BASE}/sto/ksq_bydd_trd",
-                                   headers=headers,
-                                   json={"basDd": base_date}, timeout=20)
-
-        kospi  = kospi_res.json().get("OutBlock_1",  []) if kospi_res.status_code  == 200 else []
-        kosdaq = kosdaq_res.json().get("OutBlock_1", []) if kosdaq_res.status_code == 200 else []
+        # 1. KOSPI 시세 (Spec-2: sto/stk_bydd_trd)
+        kospi  = krx_post("sto/stk_bydd_trd", {"basDd": base_date})
+        # 2. KOSDAQ 시세 (Spec-3: sto/ksq_bydd_trd)
+        kosdaq = krx_post("sto/ksq_bydd_trd", {"basDd": base_date})
+        print(f"[DEBUG] KOSPI={len(kospi)} KOSDAQ={len(kosdaq)}")
 
         if not kospi and not kosdaq:
-            return jsonify({
-                "error":         "KRX API 응답 없음",
-                "date":          base_date,
-                "kospi_status":  kospi_res.status_code,
-                "kospi_body":    kospi_res.text[:300],
-                "kosdaq_status": kosdaq_res.status_code,
-                "kosdaq_body":   kosdaq_res.text[:300],
-            }), 500
+            return jsonify({"error": "KRX 시세 API 응답 없음", "date": base_date}), 500
+
+        # 3. KOSPI 투자지표 PER/PBR/배당 (sto/stk_isu_per_pbr)
+        ind_kospi  = krx_post("sto/stk_isu_per_pbr", {"basDd": base_date})
+        # 4. KOSDAQ 투자지표 PER/PBR/배당 (sto/ksq_isu_per_pbr)
+        ind_kosdaq = krx_post("sto/ksq_isu_per_pbr", {"basDd": base_date})
+        print(f"[DEBUG] 투자지표 KOSPI={len(ind_kospi)} KOSDAQ={len(ind_kosdaq)}")
+
+        # 투자지표 딕셔너리 생성 (ISU_SRT_CD 또는 ISU_CD 기준)
+        ind_map = {}
+        for item in ind_kospi + ind_kosdaq:
+            # 투자지표 API는 ISU_SRT_CD(단축코드) 제공
+            code = (item.get("ISU_SRT_CD") or
+                    to_short_code(item.get("ISU_CD", ""))).strip()
+            if code:
+                ind_map[code] = item
 
         result = []
         for item in kospi + kosdaq:
-            isu_cd = item.get("ISU_CD", "")
-            name   = item.get("ISU_NM", "").strip()
+            isu_cd   = item.get("ISU_CD", "")
+            name     = item.get("ISU_NM", "").strip()
             if not isu_cd or not name:
                 continue
 
@@ -102,6 +96,15 @@ def stocks():
             mkt_cap  = safe_float(item.get("MKTCAP",     0))
             change   = safe_float(item.get("FLUC_RT",    0))
 
+            ind      = ind_map.get(short_cd, {})
+            eps      = safe_float(ind.get("EPS", 0))
+            dps      = safe_float(ind.get("DPS", 0))   # 주당배당금
+            div_yld  = safe_float(ind.get("DVD_YLD", 0))  # 배당수익률(%)
+            per      = safe_float(ind.get("PER", 0))
+            pbr      = safe_float(ind.get("PBR", 0))
+            # 배당성향 = 주당배당금 / EPS * 100
+            div_payout = round(dps / eps * 100, 2) if eps > 0 else 0.0
+
             result.append({
                 "id":        short_cd,
                 "name":      name,
@@ -109,19 +112,34 @@ def stocks():
                 "change":    change,
                 "marketCap": mkt_cap,
                 "capSize":   cap_size(mkt_cap),
-                "per":       0.0,
-                "pbr":       0.0,
-                "divYield":  0.0,
-                "divAmount": 0,
-                "divPayout": 0.0
+                "per":       per,
+                "pbr":       pbr,
+                "divYield":  div_yld,
+                "divAmount": int(dps),
+                "divPayout": div_payout
             })
 
         result.sort(key=lambda x: x["marketCap"], reverse=True)
+        print(f"[DEBUG] 최종: {len(result)}개")
         return jsonify(result[:2000])
 
     except Exception as e:
         import traceback
-        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+        tb = traceback.format_exc()
+        print(f"[ERROR] {tb}")
+        return jsonify({"error": str(e), "trace": tb}), 500
+
+# 투자지표 API 응답 구조 확인용
+@app.route("/test_ind")
+def test_ind():
+    base_date = latest_biz_day()
+    ind = krx_post("sto/stk_isu_per_pbr", {"basDd": base_date})
+    return jsonify({
+        "date":    base_date,
+        "count":   len(ind),
+        "sample":  ind[:3] if ind else [],
+        "keys":    list(ind[0].keys()) if ind else []
+    })
 
 @app.route("/health")
 def health():
