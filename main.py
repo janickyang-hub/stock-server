@@ -35,15 +35,20 @@ def safe_float(val):
 def stocks():
     try:
         base_date = latest_biz_day()
+        print(f"[DEBUG] 기준일: {base_date}")
 
-        # 1. 유가증권(KOSPI) 일별매매정보
-        kospi  = fetch_stock_data("OPPUSES002_S3", base_date, "STK")
-        # 2. 코스닥(KOSDAQ) 일별매매정보
+        kospi = fetch_stock_data("OPPUSES002_S3", base_date, "STK")
+        print(f"[DEBUG] KOSPI 종목수: {len(kospi)}")
+
         kosdaq = fetch_stock_data("OPPUSES002_S3", base_date, "KSQ")
-        # 3. 전종목 투자지표 (PER, PBR, EPS, BPS, 배당수익률)
-        indicators = fetch_indicator_data("OPPUSES002_S3", base_date)
+        print(f"[DEBUG] KOSDAQ 종목수: {len(kosdaq)}")
 
-        # 투자지표를 종목코드 딕셔너리로 변환
+        indicators = fetch_indicator_data("OPPUSES002_S3", base_date)
+        print(f"[DEBUG] 투자지표 종목수: {len(indicators)}")
+
+        if not kospi and not kosdaq:
+            return jsonify({"error": "KRX API 응답 없음", "date": base_date}), 500
+
         ind_map = {item.get("ISU_SRT_CD", "").strip(): item for item in indicators}
 
         result = []
@@ -51,12 +56,10 @@ def stocks():
             code = item.get("ISU_SRT_CD", "").strip()
             if not code:
                 continue
-
-            ind  = ind_map.get(code, {})
-            eps  = safe_float(ind.get("EPS", 0))
-            div  = safe_float(ind.get("DPS", 0))       # 주당배당금
-            div_yield = safe_float(ind.get("DVD_YLD", 0))  # 배당수익률
-
+            ind       = ind_map.get(code, {})
+            eps       = safe_float(ind.get("EPS", 0))
+            div       = safe_float(ind.get("DPS", 0))
+            div_yield = safe_float(ind.get("DVD_YLD", 0))
             price     = safe_float(item.get("TDD_CLSPRC", 0))
             mkt_cap   = safe_float(item.get("MKTCAP", 0))
 
@@ -73,12 +76,14 @@ def stocks():
                 "divPayout": round(div / eps * 100, 2) if eps > 0 else 0
             })
 
-        # 시가총액 기준 상위 2000개
+        print(f"[DEBUG] 최종 종목수: {len(result)}")
         result.sort(key=lambda x: x["marketCap"], reverse=True)
         return jsonify(result[:2000])
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        import traceback
+        print(f"[ERROR] {traceback.format_exc()}")
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 def fetch_stock_data(endpoint: str, base_date: str, market: str) -> list:
     """유가증권/코스닥 일별매매정보 조회"""
