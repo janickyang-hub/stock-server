@@ -189,7 +189,7 @@ def stocks():
             return jsonify({"error": "KRX 시세 API 응답 없음", "date": base_date}), 500
 
         # 2. 공공데이터포털: 전종목 배당 데이터 (1회 일괄 조회)
-        div_map = fetch_dividend_map(year)
+        div_map = fetch_dividend_map(str(int(year) - 1))
 
         # 3. 시가총액 기준 상위 2000개 선별
         all_items = []
@@ -268,7 +268,7 @@ def test_kis():
 
 @app.route("/test_div")
 def test_div():
-    year   = current_year()
+    year    = str(int(current_year()) - 1)
     div_map = fetch_dividend_map(year)
     sample = dict(list(div_map.items())[:5])
     return jsonify({"year": year, "count": len(div_map), "sample": sample})
