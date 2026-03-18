@@ -4,6 +4,7 @@ import os
 from datetime import datetime, timedelta
 import pytz
 import time
+import threading
 
 app = Flask(__name__)
 
@@ -14,8 +15,9 @@ KRX_AUTH_KEY    = "C1421182F8FD42CA999E3F73D51D0DF2C3829272"
 KRX_BASE        = "https://data-dbg.krx.co.kr/svc/apis"
 FSC_SERVICE_KEY = "e0a1fb6fedf17f785d6b35276663fb0f47bb199d21038d494ea05b2250596a30"
 
-_token_cache = {"access_token": None, "expires_at": None}
-_div_cache   = {"data": None, "date": None}
+_token_cache  = {"access_token": None, "expires_at": None}
+_div_cache    = {"data": None, "date": None}
+_stocks_cache = {"data": None, "date": None, "loading": False}
 
 def get_kis_token() -> str:
     now = datetime.now()
@@ -87,19 +89,15 @@ def cap_size(mkt_cap: float) -> str:
 
 def fetch_dividend_map() -> dict:
     today = datetime.now(pytz.timezone("Asia/Seoul")).strftime("%Y%m%d")
-
     if _div_cache["data"] is not None and _div_cache["date"] == today:
-        print(f"[DEBUG] 배당 캐시 사용: {len(_div_cache['data'])}개")
         return _div_cache["data"]
 
-    tz       = pytz.timezone("Asia/Seoul")
-    cur_yr   = datetime.now(tz).year
-    # 최근 2년치 배당기준일 범위
+    tz        = pytz.timezone("Asia/Seoul")
+    cur_yr    = datetime.now(tz).year
     date_from = f"{cur_yr - 2}0101"
     date_to   = f"{cur_yr - 1}1231"
-
-    div_map = {}
-    url     = "https://apis.data.go.kr/1160100/service/GetStocDiviInfoService/getDiviInfo"
+    div_map   = {}
+    url       = "https://apis.data.go.kr/1160100/service/GetStocDiviInfoService/getDiviInfo"
 
     try:
         page = 1
@@ -112,9 +110,7 @@ def fetch_dividend_map() -> dict:
             }
             res  = requests.get(url, params=params, timeout=20)
             if res.status_code != 200:
-                print(f"[ERROR] 배당 API: {res.status_code}")
                 break
-
             data  = res.json()
             items = (data.get("response", {})
                          .get("body", {})
@@ -122,7 +118,6 @@ def fetch_dividend_map() -> dict:
                          .get("item", []))
             if not items:
                 break
-
             for item in items:
                 if item.get("scrsItmsKcd", "") != "0101":
                     continue
@@ -134,28 +129,18 @@ def fetch_dividend_map() -> dict:
                 if len(isin) == 12 and isin.startswith("KR") and div_amt > 0:
                     code = isin[3:9]
                     if code not in div_map or dvdn_dt > div_map[code]["dvdnBasDt"]:
-                        div_map[code] = {
-                            "divAmount": int(div_amt),
-                            "dvdnBasDt": dvdn_dt,
-                        }
-
-            total = int(data.get("response", {})
-                            .get("body", {})
-                            .get("totalCount", 0))
+                        div_map[code] = {"divAmount": int(div_amt), "dvdnBasDt": dvdn_dt}
+            total = int(data.get("response", {}).get("body", {}).get("totalCount", 0))
             print(f"[DEBUG] 배당 page={page}/{(total//1000)+1} 수집={len(div_map)}")
-
             if page * 1000 >= total:
                 break
             page += 1
-
-        print(f"[DEBUG] 배당 최종: {len(div_map)}개 ({date_from}~{date_to})")
+        print(f"[DEBUG] 배당 최종: {len(div_map)}개")
         _div_cache["data"] = div_map
         _div_cache["date"] = today
-
     except Exception as e:
         import traceback
-        print(f"[ERROR] 배당 API: {traceback.format_exc()}")
-
+        print(f"[ERROR] 배당: {traceback.format_exc()}")
     return div_map
 
 def kis_get_per_pbr(stock_code: str) -> dict:
@@ -169,24 +154,20 @@ def kis_get_per_pbr(stock_code: str) -> dict:
             "per": safe_float(output.get("per", 0)),
             "pbr": safe_float(output.get("pbr", 0)),
             "eps": safe_float(output.get("eps", 0)),
-            "bps": safe_float(output.get("bps", 0)),
         }
-    except Exception as e:
-        print(f"[ERROR] KIS {stock_code}: {e}")
-        return {"per": 0, "pbr": 0, "eps": 0, "bps": 0}
+    except:
+        return {"per": 0, "pbr": 0, "eps": 0}
 
-@app.route("/stocks")
-def stocks():
+def build_stocks_data():
+    """백그라운드에서 전체 데이터 조합 — 완료 후 캐시에 저장"""
     try:
+        today     = datetime.now(pytz.timezone("Asia/Seoul")).strftime("%Y%m%d")
         base_date = latest_biz_day()
-        print(f"[DEBUG] 기준일: {base_date}")
+        print(f"[BUILD] 시작 기준일={base_date}")
 
         kospi  = krx_post("sto/stk_bydd_trd", {"basDd": base_date})
         kosdaq = krx_post("sto/ksq_bydd_trd", {"basDd": base_date})
-        print(f"[DEBUG] KRX KOSPI={len(kospi)} KOSDAQ={len(kosdaq)}")
-
-        if not kospi and not kosdaq:
-            return jsonify({"error": "KRX 시세 API 응답 없음", "date": base_date}), 500
+        print(f"[BUILD] KRX KOSPI={len(kospi)} KOSDAQ={len(kosdaq)}")
 
         div_map = fetch_dividend_map()
 
@@ -236,18 +217,60 @@ def stocks():
             if (i + 1) % 18 == 0:
                 time.sleep(1)
 
-        print(f"[DEBUG] 최종: {len(result)}개")
-        return jsonify(result)
+            if (i + 1) % 100 == 0:
+                print(f"[BUILD] KIS 조회 {i+1}/{len(top_items)}개 완료")
+
+        _stocks_cache["data"]    = result
+        _stocks_cache["date"]    = today
+        _stocks_cache["loading"] = False
+        print(f"[BUILD] 완료! 총 {len(result)}개")
 
     except Exception as e:
         import traceback
-        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+        print(f"[BUILD ERROR] {traceback.format_exc()}")
+        _stocks_cache["loading"] = False
+
+@app.route("/stocks")
+def stocks():
+    today = datetime.now(pytz.timezone("Asia/Seoul")).strftime("%Y%m%d")
+
+    # 캐시가 있으면 즉시 반환
+    if _stocks_cache["data"] and _stocks_cache["date"] == today:
+        print(f"[DEBUG] 캐시 반환: {len(_stocks_cache['data'])}개")
+        return jsonify(_stocks_cache["data"])
+
+    # 백그라운드 빌드 중이면 대기 안내
+    if _stocks_cache["loading"]:
+        return jsonify({
+            "status":  "loading",
+            "message": "데이터 준비 중입니다. 5분 후 다시 시도해 주세요."
+        }), 202
+
+    # 백그라운드에서 데이터 빌드 시작
+    _stocks_cache["loading"] = True
+    t = threading.Thread(target=build_stocks_data, daemon=True)
+    t.start()
+
+    return jsonify({
+        "status":  "loading",
+        "message": "데이터 준비를 시작했습니다. 5~10분 후 다시 요청해 주세요."
+    }), 202
+
+@app.route("/stocks/status")
+def stocks_status():
+    today = datetime.now(pytz.timezone("Asia/Seoul")).strftime("%Y%m%d")
+    return jsonify({
+        "cached":   _stocks_cache["data"] is not None and _stocks_cache["date"] == today,
+        "loading":  _stocks_cache["loading"],
+        "count":    len(_stocks_cache["data"]) if _stocks_cache["data"] else 0,
+        "date":     _stocks_cache["date"],
+    })
 
 @app.route("/test_div")
 def test_div():
     _div_cache["data"] = None
     div_map = fetch_dividend_map()
-    sample  = dict(list(div_map.items())[:5])
+    sample  = dict(list(div_map.items())[:3])
     return jsonify({"count": len(div_map), "sample": sample})
 
 @app.route("/test_kis")
@@ -255,10 +278,7 @@ def test_kis():
     token = get_kis_token()
     if not token:
         return jsonify({"error": "토큰 발급 실패"})
-    return jsonify({
-        "token_ok":     True,
-        "samsung_test": kis_get_per_pbr("005930")
-    })
+    return jsonify({"token_ok": True, "samsung_test": kis_get_per_pbr("005930")})
 
 @app.route("/health")
 def health():
