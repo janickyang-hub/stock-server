@@ -102,9 +102,9 @@ def fetch_dividend_map() -> dict:
     tz       = pytz.timezone("Asia/Seoul")
     now      = datetime.now(tz)
     # 최근 1년 배당기준일 범위
-    prev_yr   = now.year - 1
-    date_from = f"{prev_yr}0101"
-    date_to   = f"{prev_yr}1231"
+prev_yr   = datetime.now(tz).year - 1
+date_from = f"{prev_yr - 1}0101"  # 2년 전 1월 1일
+date_to   = f"{prev_yr}1231"      # 전년도 12월 31일
     
     div_map = {}
     url     = "https://apis.data.go.kr/1160100/service/GetStocDiviInfoService/getDiviInfo"
