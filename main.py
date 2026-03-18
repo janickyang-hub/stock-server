@@ -174,8 +174,6 @@ def kis_get_per_pbr(stock_code: str) -> dict:
         return {"per": 0, "pbr": 0, "eps": 0}
 
 def build_stocks_data():
-    if _stocks_cache["loading"]:
-        return
     _stocks_cache["loading"]  = True
     _stocks_cache["error"]    = None
     _stocks_cache["progress"] = 0
@@ -323,7 +321,8 @@ def test_kis():
 def health():
     return jsonify({"status": "ok", "date": latest_biz_day()})
 
-# 서버 시작 시 자동 로드
+# 서버 시작 시 자동 로드 (loading 플래그 먼저 설정)
+_stocks_cache["loading"] = True
 threading.Thread(target=build_stocks_data, daemon=True).start()
 
 if __name__ == "__main__":
