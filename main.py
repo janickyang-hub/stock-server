@@ -375,7 +375,7 @@ def kis_get_financial(stock_code: str) -> dict:
     """3년간 연간 실적 (매출, 영업이익, 순이익, EPS) - FHKST66430200"""
     url    = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/finance/income-statement"
     params = {
-        "FID_DIV_CLS_CODE": "1",   # 1: 연간
+        "FID_DIV_CLS_CODE": "0",   # 0: 연간
         "fid_cond_mrkt_div_code": "J",
         "fid_input_iscd": stock_code,
     }
@@ -388,9 +388,10 @@ def kis_get_financial(stock_code: str) -> dict:
             result.append({
                 "stac_yymm":   item.get("stac_yymm",   ""),   # 결산년월
                 "sale_account": safe_float(item.get("sale_account", 0)),  # 매출액
-                "bsop_prti":   safe_float(item.get("bsop_prti",   0)),   # 영업이익
-                "net_income":  safe_float(item.get("net_income",  0)),   # 순이익
-                "eps":         safe_float(item.get("eps",         0)),   # EPS
+                "bsop_prti":        safe_float(item.get("bsop_prti",        0)),  # 영업이익
+                "net_income":       safe_float(item.get("thtr_ntin",        0)),  # 당기순이익
+                "sale_totl_prfi":   safe_float(item.get("sale_totl_prfi",   0)),  # 매출총이익
+                "eps":              0.0,  # KIS API 미제공
             })
         return result
     except Exception as e:
