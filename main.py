@@ -264,9 +264,6 @@ def build_stocks_data():
         _stocks_cache["error"]    = str(e)
         _stocks_cache["step"]     = "오류 발생"
 
-# 서버 시작 시 자동 로드
-start_background_load()
-
 @app.route("/stocks")
 def stocks():
     today = datetime.now(pytz.timezone("Asia/Seoul")).strftime("%Y%m%d")
@@ -323,6 +320,9 @@ def test_kis():
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "date": latest_biz_day()})
+
+# 서버 시작 시 자동 로드
+start_background_load()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
