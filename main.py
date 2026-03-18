@@ -1,6 +1,7 @@
 from flask import Flask, jsonify
 import requests
 import os
+import json
 from datetime import datetime, timedelta, timezone
 import time
 import threading
@@ -14,15 +15,14 @@ KRX_AUTH_KEY    = "C1421182F8FD42CA999E3F73D51D0DF2C3829272"
 KRX_BASE        = "https://data-dbg.krx.co.kr/svc/apis"
 FSC_SERVICE_KEY = "e0a1fb6fedf17f785d6b35276663fb0f47bb199d21038d494ea05b2250596a30"
 
-# KIS API 호출 대상 (시가총액 상위 N개만)
-KIS_TOP_N = 500
-
-KST = timezone(timedelta(hours=9))
+KIS_TOP_N    = 500
+KST          = timezone(timedelta(hours=9))
+CACHE_FILE   = "/tmp/stocks_cache.json"   # 파일 캐시 경로
 
 _token_cache  = {"access_token": None, "expires_at": None}
 _div_cache    = {"data": None, "date": None}
-_stocks_cache = {
-    "data": None, "date": None, "loading": False, "error": None,
+_build_status = {
+    "loading": False, "error": None,
     "progress": 0, "step": "", "total": 0, "current": 0,
 }
 
@@ -33,13 +33,39 @@ def today_str():
     return now_kst().strftime("%Y%m%d")
 
 def latest_biz_day():
-    now  = now_kst()
-    d    = now - timedelta(days=1) if now.hour < 16 else now
+    now = now_kst()
+    d   = now - timedelta(days=1) if now.hour < 16 else now
     for _ in range(7):
         if d.weekday() < 5:
             break
         d -= timedelta(days=1)
     return d.strftime("%Y%m%d")
+
+# =============================================
+# 파일 캐시 (워커 재시작해도 유지)
+# =============================================
+def load_file_cache():
+    """파일에서 캐시 로드. 오늘 날짜 데이터면 반환."""
+    try:
+        if not os.path.exists(CACHE_FILE):
+            return None
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+        if cache.get("date") == today_str() and cache.get("data"):
+            print(f"[CACHE] 파일 캐시 로드: {len(cache['data'])}개")
+            return cache["data"]
+    except Exception as e:
+        print(f"[CACHE] 파일 캐시 로드 실패: {e}")
+    return None
+
+def save_file_cache(data):
+    """데이터를 파일에 저장."""
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"date": today_str(), "data": data}, f, ensure_ascii=False)
+        print(f"[CACHE] 파일 캐시 저장: {len(data)}개")
+    except Exception as e:
+        print(f"[CACHE] 파일 캐시 저장 실패: {e}")
 
 def get_kis_token():
     now = datetime.now()
@@ -164,31 +190,31 @@ def kis_get_per_pbr(stock_code):
         return {"per": 0, "pbr": 0, "eps": 0}
 
 def build_stocks_data():
-    _stocks_cache["loading"]  = True
-    _stocks_cache["error"]    = None
-    _stocks_cache["progress"] = 0
-    _stocks_cache["current"]  = 0
-    _stocks_cache["total"]    = 0
+    _build_status["loading"]  = True
+    _build_status["error"]    = None
+    _build_status["progress"] = 0
+    _build_status["current"]  = 0
+    _build_status["total"]    = 0
 
     try:
         today     = today_str()
         base_date = latest_biz_day()
 
-        # 1단계: KRX 시세 (5%)
-        _stocks_cache["step"]     = "한국거래소 시세 조회 중..."
-        _stocks_cache["progress"] = 5
+        # 1단계: KRX 시세
+        _build_status["step"]     = "한국거래소 시세 조회 중..."
+        _build_status["progress"] = 5
         kospi  = krx_post("sto/stk_bydd_trd", {"basDd": base_date})
         kosdaq = krx_post("sto/ksq_bydd_trd", {"basDd": base_date})
         print(f"[BUILD] KRX KOSPI={len(kospi)} KOSDAQ={len(kosdaq)}")
 
-        # 2단계: 배당 (10~30%)
-        _stocks_cache["step"]     = "배당 정보 수집 중..."
-        _stocks_cache["progress"] = 10
+        # 2단계: 배당
+        _build_status["step"]     = "배당 정보 수집 중..."
+        _build_status["progress"] = 10
         div_map = fetch_dividend_map()
-        _stocks_cache["progress"] = 30
+        _build_status["progress"] = 30
 
         # 3단계: 종목 정렬
-        _stocks_cache["step"] = "종목 선별 중..."
+        _build_status["step"] = "종목 선별 중..."
         all_items = []
         for item in kospi + kosdaq:
             isu_cd  = item.get("ISU_CD", "")
@@ -207,29 +233,22 @@ def build_stocks_data():
 
         all_items.sort(key=lambda x: x["marketCap"], reverse=True)
         top_items = all_items[:2000]
-        total     = len(top_items)
-        _stocks_cache["total"]    = total
-        _stocks_cache["progress"] = 35
+        _build_status["total"]    = KIS_TOP_N
+        _build_status["progress"] = 35
 
-        # 4단계: KIS PER/PBR — 상위 KIS_TOP_N개만 호출 (35~100%)
-        # 나머지는 배당 데이터만 적용, PER/PBR=0
+        # 4단계: KIS PER/PBR — 상위 500개만
         kis_map = {}
-        kis_targets = top_items[:KIS_TOP_N]
-        print(f"[BUILD] KIS 호출 대상: {len(kis_targets)}개 (상위 {KIS_TOP_N}개)")
-
-        for i, item in enumerate(kis_targets):
-            _stocks_cache["step"]     = f"투자지표 조회 중... ({i+1}/{KIS_TOP_N})"
-            _stocks_cache["current"]  = i + 1
-            _stocks_cache["progress"] = 35 + int((i + 1) / KIS_TOP_N * 65)
-
-            kis_map[item["id"]] = kis_get_per_pbr(item["id"])
-
+        for i, item in enumerate(top_items[:KIS_TOP_N]):
+            _build_status["step"]     = f"투자지표 조회 중... ({i+1}/{KIS_TOP_N})"
+            _build_status["current"]  = i + 1
+            _build_status["progress"] = 35 + int((i + 1) / KIS_TOP_N * 65)
+            kis_map[item["id"]]       = kis_get_per_pbr(item["id"])
             if (i + 1) % 18 == 0:
                 time.sleep(1)
             if (i + 1) % 100 == 0:
                 print(f"[BUILD] KIS 조회 {i+1}/{KIS_TOP_N}개 완료")
 
-        # 5단계: 전체 결합
+        # 5단계: 결합
         result = []
         for item in top_items:
             ind        = kis_map.get(item["id"], {"per": 0, "pbr": 0, "eps": 0})
@@ -239,7 +258,6 @@ def build_stocks_data():
             div_yield  = round(div_amt / price * 100, 2) if price > 0 and div_amt > 0 else 0.0
             eps        = ind.get("eps", 0)
             div_payout = round(div_amt / eps * 100, 2) if eps > 0 and div_amt > 0 else 0.0
-
             result.append({
                 "id":        item["id"],
                 "name":      item["name"],
@@ -254,37 +272,40 @@ def build_stocks_data():
                 "divPayout": div_payout
             })
 
-        _stocks_cache["data"]     = result
-        _stocks_cache["date"]     = today
-        _stocks_cache["loading"]  = False
-        _stocks_cache["progress"] = 100
-        _stocks_cache["step"]     = "완료"
-        print(f"[BUILD] 완료! 총 {len(result)}개 (KIS 조회 {KIS_TOP_N}개)")
+        # 파일 캐시에 저장 (워커 재시작 후에도 유지)
+        save_file_cache(result)
+
+        _build_status["loading"]  = False
+        _build_status["progress"] = 100
+        _build_status["step"]     = "완료"
+        print(f"[BUILD] 완료! 총 {len(result)}개")
 
     except Exception as e:
         import traceback
         print(f"[BUILD ERROR] {traceback.format_exc()}")
-        _stocks_cache["loading"] = False
-        _stocks_cache["error"]   = str(e)
-        _stocks_cache["step"]    = "오류 발생"
+        _build_status["loading"] = False
+        _build_status["error"]   = str(e)
+        _build_status["step"]    = "오류 발생"
 
 @app.route("/stocks")
 def stocks():
-    today = today_str()
-    if _stocks_cache["data"] and _stocks_cache["date"] == today:
-        print(f"[DEBUG] 캐시 반환: {len(_stocks_cache['data'])}개")
-        return jsonify(_stocks_cache["data"])
+    # 1순위: 파일 캐시 (워커 재시작 후에도 유지)
+    cached = load_file_cache()
+    if cached:
+        return jsonify(cached)
 
-    if _stocks_cache["loading"]:
+    # 2순위: 빌드 중
+    if _build_status["loading"]:
         return jsonify({
             "status":   "loading",
-            "progress": _stocks_cache["progress"],
-            "step":     _stocks_cache["step"],
-            "current":  _stocks_cache["current"],
-            "total":    _stocks_cache["total"],
+            "progress": _build_status["progress"],
+            "step":     _build_status["step"],
+            "current":  _build_status["current"],
+            "total":    _build_status["total"],
         }), 202
 
-    _stocks_cache["loading"] = True
+    # 3순위: 빌드 시작
+    _build_status["loading"] = True
     threading.Thread(target=build_stocks_data, daemon=True).start()
     return jsonify({
         "status": "loading", "progress": 0,
@@ -293,16 +314,16 @@ def stocks():
 
 @app.route("/stocks/status")
 def stocks_status():
-    today = today_str()
+    cached = load_file_cache()
     return jsonify({
-        "cached":   _stocks_cache["data"] is not None and _stocks_cache["date"] == today,
-        "loading":  _stocks_cache["loading"],
-        "progress": _stocks_cache["progress"],
-        "step":     _stocks_cache["step"],
-        "current":  _stocks_cache["current"],
-        "total":    _stocks_cache["total"],
-        "count":    len(_stocks_cache["data"]) if _stocks_cache["data"] else 0,
-        "error":    _stocks_cache["error"],
+        "cached":   cached is not None,
+        "loading":  _build_status["loading"],
+        "progress": _build_status["progress"],
+        "step":     _build_status["step"],
+        "current":  _build_status["current"],
+        "total":    _build_status["total"],
+        "count":    len(cached) if cached else 0,
+        "error":    _build_status["error"],
     })
 
 @app.route("/test_kis")
@@ -322,9 +343,13 @@ def test_div():
 def health():
     return jsonify({"status": "ok", "date": latest_biz_day()})
 
-# 서버 시작 시 자동 로드
-_stocks_cache["loading"] = True
-threading.Thread(target=build_stocks_data, daemon=True).start()
+# 서버 시작 시: 파일 캐시 없으면 백그라운드 빌드 시작
+if not load_file_cache():
+    print("[SERVER] 파일 캐시 없음 → 백그라운드 빌드 시작")
+    _build_status["loading"] = True
+    threading.Thread(target=build_stocks_data, daemon=True).start()
+else:
+    print("[SERVER] 파일 캐시 있음 → 즉시 서비스 가능")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
