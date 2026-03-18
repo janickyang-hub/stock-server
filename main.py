@@ -17,7 +17,20 @@ FSC_SERVICE_KEY = "e0a1fb6fedf17f785d6b35276663fb0f47bb199d21038d494ea05b2250596
 
 _token_cache  = {"access_token": None, "expires_at": None}
 _div_cache    = {"data": None, "date": None}
-_stocks_cache = {"data": None, "date": None, "loading": False}
+_stocks_cache = {
+    "data":     None,
+    "date":     None,
+    "loading":  False,
+    "error":    None,
+    "progress": 0,      # 0~100 진행률
+    "step":     "",     # 현재 단계 메시지
+    "total":    0,      # 전체 종목 수
+    "current":  0,      # 현재 처리 종목 수
+}
+
+def start_background_load():
+    t = threading.Thread(target=build_stocks_data, daemon=True)
+    t.start()
 
 def get_kis_token() -> str:
     now = datetime.now()
@@ -33,7 +46,6 @@ def get_kis_token() -> str:
     if token:
         _token_cache["access_token"] = token
         _token_cache["expires_at"]   = now + timedelta(hours=23)
-        print("[DEBUG] KIS 토큰 발급 성공")
     return token
 
 def kis_headers(tr_id: str) -> dict:
@@ -131,11 +143,9 @@ def fetch_dividend_map() -> dict:
                     if code not in div_map or dvdn_dt > div_map[code]["dvdnBasDt"]:
                         div_map[code] = {"divAmount": int(div_amt), "dvdnBasDt": dvdn_dt}
             total = int(data.get("response", {}).get("body", {}).get("totalCount", 0))
-            print(f"[DEBUG] 배당 page={page}/{(total//1000)+1} 수집={len(div_map)}")
             if page * 1000 >= total:
                 break
             page += 1
-        print(f"[DEBUG] 배당 최종: {len(div_map)}개")
         _div_cache["data"] = div_map
         _div_cache["date"] = today
     except Exception as e:
@@ -159,18 +169,33 @@ def kis_get_per_pbr(stock_code: str) -> dict:
         return {"per": 0, "pbr": 0, "eps": 0}
 
 def build_stocks_data():
-    """백그라운드에서 전체 데이터 조합 — 완료 후 캐시에 저장"""
+    if _stocks_cache["loading"]:
+        return
+
+    _stocks_cache["loading"]  = True
+    _stocks_cache["error"]    = None
+    _stocks_cache["progress"] = 0
+    _stocks_cache["current"]  = 0
+    _stocks_cache["total"]    = 0
+
     try:
         today     = datetime.now(pytz.timezone("Asia/Seoul")).strftime("%Y%m%d")
         base_date = latest_biz_day()
-        print(f"[BUILD] 시작 기준일={base_date}")
 
+        # 1단계: KRX 시세 조회 (5%)
+        _stocks_cache["step"] = "한국거래소 시세 조회 중..."
+        _stocks_cache["progress"] = 5
         kospi  = krx_post("sto/stk_bydd_trd", {"basDd": base_date})
         kosdaq = krx_post("sto/ksq_bydd_trd", {"basDd": base_date})
-        print(f"[BUILD] KRX KOSPI={len(kospi)} KOSDAQ={len(kosdaq)}")
 
+        # 2단계: 배당 데이터 조회 (5~30%)
+        _stocks_cache["step"] = "배당 정보 수집 중..."
+        _stocks_cache["progress"] = 10
         div_map = fetch_dividend_map()
+        _stocks_cache["progress"] = 30
 
+        # 3단계: 종목 정렬 및 선별
+        _stocks_cache["step"] = "종목 선별 중..."
         all_items = []
         for item in kospi + kosdaq:
             isu_cd  = item.get("ISU_CD", "")
@@ -189,9 +214,17 @@ def build_stocks_data():
 
         all_items.sort(key=lambda x: x["marketCap"], reverse=True)
         top_items = all_items[:2000]
+        total     = len(top_items)
+        _stocks_cache["total"]    = total
+        _stocks_cache["progress"] = 35
 
+        # 4단계: KIS PER/PBR 조회 (35~100%)
         result = []
         for i, item in enumerate(top_items):
+            _stocks_cache["step"]     = f"투자지표 조회 중... ({i+1}/{total})"
+            _stocks_cache["current"]  = i + 1
+            _stocks_cache["progress"] = 35 + int((i + 1) / total * 65)
+
             ind        = kis_get_per_pbr(item["id"])
             div        = div_map.get(item["id"], {})
             price      = item["price"]
@@ -217,43 +250,47 @@ def build_stocks_data():
             if (i + 1) % 18 == 0:
                 time.sleep(1)
 
-            if (i + 1) % 100 == 0:
-                print(f"[BUILD] KIS 조회 {i+1}/{len(top_items)}개 완료")
-
-        _stocks_cache["data"]    = result
-        _stocks_cache["date"]    = today
-        _stocks_cache["loading"] = False
+        _stocks_cache["data"]     = result
+        _stocks_cache["date"]     = today
+        _stocks_cache["loading"]  = False
+        _stocks_cache["progress"] = 100
+        _stocks_cache["step"]     = "완료"
         print(f"[BUILD] 완료! 총 {len(result)}개")
 
     except Exception as e:
         import traceback
         print(f"[BUILD ERROR] {traceback.format_exc()}")
-        _stocks_cache["loading"] = False
+        _stocks_cache["loading"]  = False
+        _stocks_cache["error"]    = str(e)
+        _stocks_cache["step"]     = "오류 발생"
+
+# 서버 시작 시 자동 로드
+start_background_load()
 
 @app.route("/stocks")
 def stocks():
     today = datetime.now(pytz.timezone("Asia/Seoul")).strftime("%Y%m%d")
-
-    # 캐시가 있으면 즉시 반환
     if _stocks_cache["data"] and _stocks_cache["date"] == today:
-        print(f"[DEBUG] 캐시 반환: {len(_stocks_cache['data'])}개")
         return jsonify(_stocks_cache["data"])
 
-    # 백그라운드 빌드 중이면 대기 안내
     if _stocks_cache["loading"]:
         return jsonify({
-            "status":  "loading",
-            "message": "데이터 준비 중입니다. 5분 후 다시 시도해 주세요."
+            "status":   "loading",
+            "progress": _stocks_cache["progress"],
+            "step":     _stocks_cache["step"],
+            "current":  _stocks_cache["current"],
+            "total":    _stocks_cache["total"],
         }), 202
 
-    # 백그라운드에서 데이터 빌드 시작
+    # 캐시 없고 빌드도 아닌 경우 재시작
     _stocks_cache["loading"] = True
-    t = threading.Thread(target=build_stocks_data, daemon=True)
-    t.start()
-
+    threading.Thread(target=build_stocks_data, daemon=True).start()
     return jsonify({
-        "status":  "loading",
-        "message": "데이터 준비를 시작했습니다. 5~10분 후 다시 요청해 주세요."
+        "status":   "loading",
+        "progress": 0,
+        "step":     "데이터 준비를 시작합니다...",
+        "current":  0,
+        "total":    0,
     }), 202
 
 @app.route("/stocks/status")
@@ -262,16 +299,19 @@ def stocks_status():
     return jsonify({
         "cached":   _stocks_cache["data"] is not None and _stocks_cache["date"] == today,
         "loading":  _stocks_cache["loading"],
+        "progress": _stocks_cache["progress"],
+        "step":     _stocks_cache["step"],
+        "current":  _stocks_cache["current"],
+        "total":    _stocks_cache["total"],
         "count":    len(_stocks_cache["data"]) if _stocks_cache["data"] else 0,
-        "date":     _stocks_cache["date"],
+        "error":    _stocks_cache["error"],
     })
 
 @app.route("/test_div")
 def test_div():
     _div_cache["data"] = None
     div_map = fetch_dividend_map()
-    sample  = dict(list(div_map.items())[:3])
-    return jsonify({"count": len(div_map), "sample": sample})
+    return jsonify({"count": len(div_map), "sample": dict(list(div_map.items())[:3])})
 
 @app.route("/test_kis")
 def test_kis():
