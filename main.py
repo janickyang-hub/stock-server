@@ -34,7 +34,7 @@ def today_str():
 
 def latest_biz_day():
     now = now_kst()
-    d   = now - timedelta(days=1) if now.hour < 16 else now
+    date = now - timedelta(days=1) if now.hour < 18 else now
     for _ in range(7):
         if d.weekday() < 5:
             break
