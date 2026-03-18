@@ -32,15 +32,31 @@ def now_kst():
 def today_str():
     return now_kst().strftime("%Y%m%d")
 
-def latest_biz_day():
+def latest_biz_day() -> str:
+    """KRX에 실제 데이터가 있는 가장 최근 영업일 탐색"""
     now = now_kst()
-    date = now - timedelta(days=1) if now.hour < 18 else now
-    for _ in range(7):
-        if d.weekday() < 5:
-            break
-        d -= timedelta(days=1)
+    # 최근 7일 중 데이터 있는 날 탐색
+    for i in range(7):
+        d = now - timedelta(days=i)
+        if d.weekday() >= 5:  # 주말 제외
+            continue
+        date_str = d.strftime("%Y%m%d")
+        try:
+            url     = f"{KRX_BASE}/sto/stk_bydd_trd"
+            headers = {"AUTH_KEY": KRX_AUTH_KEY,
+                       "Content-Type": "application/json; charset=UTF-8"}
+            res     = requests.post(url, headers=headers,
+                                    json={"basDd": date_str}, timeout=10)
+            items   = res.json().get("OutBlock_1", [])
+            if items:
+                print(f"[DEBUG] KRX 유효 날짜: {date_str} ({len(items)}개)")
+                return date_str
+        except:
+            continue
+    # 탐색 실패 시 3일 전 반환
+    d = now - timedelta(days=3)
     return d.strftime("%Y%m%d")
-
+    
 # =============================================
 # 파일 캐시 (워커 재시작해도 유지)
 # =============================================
