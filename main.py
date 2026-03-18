@@ -350,6 +350,18 @@ if not load_file_cache():
     threading.Thread(target=build_stocks_data, daemon=True).start()
 else:
     print("[SERVER] 파일 캐시 있음 → 즉시 서비스 가능")
+    
+@app.route("/debug/<stock_code>")
+def debug_financial(stock_code):
+    url    = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/finance/income-statement"
+    params = {
+        "FID_DIV_CLS_CODE":      "0",   # 0: 연간, 1: 분기
+        "fid_cond_mrkt_div_code": "J",
+        "fid_input_iscd":         stock_code,
+    }
+    res  = requests.get(url, headers=kis_headers("FHKST66430200"),
+                        params=params, timeout=10)
+    return jsonify(res.json())
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
