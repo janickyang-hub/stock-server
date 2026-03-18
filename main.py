@@ -85,27 +85,19 @@ def cap_size(mkt_cap: float) -> str:
     if mkt_cap >= 300_000_000_000:   return "mid"
     return "small"
 
-# =============================================
-# 공공데이터포털 배당 API
-# dvdnBasDt(배당기준일) 기준 최근 1년치만 수집
-# → 페이지 수 대폭 감소, 타임아웃 방지
-# → 서버 캐시로 하루 1회만 조회
-# =============================================
 def fetch_dividend_map() -> dict:
     today = datetime.now(pytz.timezone("Asia/Seoul")).strftime("%Y%m%d")
 
-    # 캐시 확인
     if _div_cache["data"] is not None and _div_cache["date"] == today:
         print(f"[DEBUG] 배당 캐시 사용: {len(_div_cache['data'])}개")
         return _div_cache["data"]
 
     tz       = pytz.timezone("Asia/Seoul")
-    now      = datetime.now(tz)
-    # 최근 1년 배당기준일 범위
-prev_yr   = datetime.now(tz).year - 1
-date_from = f"{prev_yr - 1}0101"  # 2년 전 1월 1일
-date_to   = f"{prev_yr}1231"      # 전년도 12월 31일
-    
+    cur_yr   = datetime.now(tz).year
+    # 최근 2년치 배당기준일 범위
+    date_from = f"{cur_yr - 2}0101"
+    date_to   = f"{cur_yr - 1}1231"
+
     div_map = {}
     url     = "https://apis.data.go.kr/1160100/service/GetStocDiviInfoService/getDiviInfo"
 
@@ -120,7 +112,7 @@ date_to   = f"{prev_yr}1231"      # 전년도 12월 31일
             }
             res  = requests.get(url, params=params, timeout=20)
             if res.status_code != 200:
-                print(f"[ERROR] 배당 API: {res.status_code} {res.text[:100]}")
+                print(f"[ERROR] 배당 API: {res.status_code}")
                 break
 
             data  = res.json()
@@ -131,29 +123,16 @@ date_to   = f"{prev_yr}1231"      # 전년도 12월 31일
             if not items:
                 break
 
-            stop = False
             for item in items:
-                # 보통주만
                 if item.get("scrsItmsKcd", "") != "0101":
                     continue
-
                 dvdn_dt = item.get("dvdnBasDt", "")
-
-                # 배당기준일이 1년 이전이면 수집 중단
-                # (API가 최신순으로 정렬되어 있다고 가정)
-                if dvdn_dt and dvdn_dt < date_from:
-                    stop = True
-                    break
-
-                # 1년 이내 데이터만 처리
-                if dvdn_dt < date_from or dvdn_dt > date_to:
+                if not (date_from <= dvdn_dt <= date_to):
                     continue
-
                 isin    = item.get("isinCd", "")
                 div_amt = safe_float(item.get("stckGenrDvdnAmt", 0))
                 if len(isin) == 12 and isin.startswith("KR") and div_amt > 0:
                     code = isin[3:9]
-                    # 같은 종목 중 가장 최근 배당기준일 유지
                     if code not in div_map or dvdn_dt > div_map[code]["dvdnBasDt"]:
                         div_map[code] = {
                             "divAmount": int(div_amt),
@@ -163,14 +142,13 @@ date_to   = f"{prev_yr}1231"      # 전년도 12월 31일
             total = int(data.get("response", {})
                             .get("body", {})
                             .get("totalCount", 0))
-            print(f"[DEBUG] 배당 page={page} 수집={len(div_map)}")
+            print(f"[DEBUG] 배당 page={page}/{(total//1000)+1} 수집={len(div_map)}")
 
-            if stop or page * 1000 >= total:
+            if page * 1000 >= total:
                 break
             page += 1
 
-        print(f"[DEBUG] 배당 최종: {len(div_map)}개 ({page}페이지)")
-
+        print(f"[DEBUG] 배당 최종: {len(div_map)}개 ({date_from}~{date_to})")
         _div_cache["data"] = div_map
         _div_cache["date"] = today
 
@@ -267,6 +245,7 @@ def stocks():
 
 @app.route("/test_div")
 def test_div():
+    _div_cache["data"] = None
     div_map = fetch_dividend_map()
     sample  = dict(list(div_map.items())[:5])
     return jsonify({"count": len(div_map), "sample": sample})
