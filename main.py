@@ -353,3 +353,72 @@ else:
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+
+
+# =============================================
+# 종목 상세 API
+# =============================================
+
+def kis_get_financial(stock_code: str) -> dict:
+    """3년간 연간 실적 (매출, 영업이익, 순이익, EPS) - FHKST66430200"""
+    url    = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/finance/income-statement"
+    params = {
+        "FID_DIV_CLS_CODE": "1",   # 1: 연간
+        "fid_cond_mrkt_div_code": "J",
+        "fid_input_iscd": stock_code,
+    }
+    try:
+        res    = requests.get(url, headers=kis_headers("FHKST66430200"),
+                              params=params, timeout=10)
+        output = res.json().get("output", [])
+        result = []
+        for item in output[:3]:  # 최근 3년
+            result.append({
+                "stac_yymm":   item.get("stac_yymm",   ""),   # 결산년월
+                "sale_account": safe_float(item.get("sale_account", 0)),  # 매출액
+                "bsop_prti":   safe_float(item.get("bsop_prti",   0)),   # 영업이익
+                "net_income":  safe_float(item.get("net_income",  0)),   # 순이익
+                "eps":         safe_float(item.get("eps",         0)),   # EPS
+            })
+        return result
+    except Exception as e:
+        print(f"[ERROR] 재무 {stock_code}: {e}")
+        return []
+
+def kis_get_investor(stock_code: str) -> dict:
+    """전일 투자자별 매매 수량 - FHKST01010900"""
+    url    = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-investor"
+    params = {
+        "FID_COND_MRKT_DIV_CODE": "J",
+        "FID_INPUT_ISCD":         stock_code,
+    }
+    try:
+        res    = requests.get(url, headers=kis_headers("FHKST01010900"),
+                              params=params, timeout=10)
+        output = res.json().get("output", [])
+        result = []
+        for item in output[:1]:  # 전일 데이터
+            result.append({
+                "stck_bsop_date": item.get("stck_bsop_date", ""),  # 날짜
+                "prsn_ntby_qty":  safe_float(item.get("prsn_ntby_qty", 0)),   # 개인 순매수
+                "frgn_ntby_qty":  safe_float(item.get("frgn_ntby_qty", 0)),   # 외국인 순매수
+                "orgn_ntby_qty":  safe_float(item.get("orgn_ntby_qty", 0)),   # 기관 순매수
+            })
+        return result
+    except Exception as e:
+        print(f"[ERROR] 투자자 {stock_code}: {e}")
+        return []
+
+@app.route("/stock/<stock_code>/detail")
+def stock_detail(stock_code: str):
+    try:
+        financial = kis_get_financial(stock_code)
+        investor  = kis_get_investor(stock_code)
+        return jsonify({
+            "code":      stock_code,
+            "financial": financial,
+            "investor":  investor,
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
