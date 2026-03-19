@@ -19,6 +19,9 @@ KIS_TOP_N  = 500
 KST        = timezone(timedelta(hours=9))
 CACHE_FILE = "/tmp/stocks_cache.json"
 
+# ✅ 개선: 캐시 유효 시간을 72시간으로 설정 (날짜 기반 → 시간 기반)
+CACHE_TTL_HOURS = 72
+
 _token_cache  = {"access_token": None, "expires_at": None}
 _div_cache    = {"data": None, "date": None}
 _build_status = {
@@ -112,17 +115,45 @@ def cap_size(mkt_cap):
     return "small"
 
 # =============================================
-# 파일 캐시
+# ✅ 개선: 파일 캐시 — 날짜 대신 72시간 TTL 사용
 # =============================================
-def load_file_cache():
+def load_file_cache(allow_stale=False):
+    """
+    allow_stale=False: 72시간 이내 캐시만 반환
+    allow_stale=True:  만료된 캐시도 반환 (오프라인/콜드스타트 폴백용)
+    """
     try:
         if not os.path.exists(CACHE_FILE):
             return None
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
             cache = json.load(f)
-        if cache.get("date") == today_str() and cache.get("data"):
-            print(f"[CACHE] 파일 캐시 로드: {len(cache['data'])}개")
-            return cache["data"]
+
+        saved_at = cache.get("saved_at")  # ✅ 저장 시각(ISO) 추가
+        data     = cache.get("data")
+
+        if not data:
+            return None
+
+        if allow_stale:
+            # 만료 여부 무관하게 반환 (오프라인 폴백)
+            print(f"[CACHE] 스테일 캐시 사용 (저장: {saved_at}): {len(data)}개")
+            return data
+
+        if saved_at:
+            saved_dt = datetime.fromisoformat(saved_at)
+            age_hours = (datetime.now(KST) - saved_dt).total_seconds() / 3600
+            if age_hours <= CACHE_TTL_HOURS:
+                print(f"[CACHE] 파일 캐시 로드 ({age_hours:.1f}시간 전): {len(data)}개")
+                return data
+            else:
+                print(f"[CACHE] 캐시 만료 ({age_hours:.1f}시간 전 저장)")
+                return None
+        else:
+            # 구버전 캐시: date 필드만 있는 경우 → 오늘 날짜면 허용
+            if cache.get("date") == today_str():
+                return data
+            return None
+
     except Exception as e:
         print(f"[CACHE] 파일 캐시 로드 실패: {e}")
     return None
@@ -130,7 +161,11 @@ def load_file_cache():
 def save_file_cache(data):
     try:
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"date": today_str(), "data": data}, f, ensure_ascii=False)
+            json.dump({
+                "date":     today_str(),
+                "saved_at": datetime.now(KST).isoformat(),  # ✅ 저장 시각 추가
+                "data":     data
+            }, f, ensure_ascii=False)
         print(f"[CACHE] 파일 캐시 저장: {len(data)}개")
     except Exception as e:
         print(f"[CACHE] 파일 캐시 저장 실패: {e}")
@@ -172,7 +207,7 @@ def fetch_dividend_map():
                 div_amt = safe_float(item.get("stckGenrDvdnAmt", 0))
                 if len(isin) == 12 and isin.startswith("KR") and div_amt > 0:
                     code         = isin[3:9]
-                    pay_dt       = item.get("cashDvdnPayDt", "")  # 현금배당지급일
+                    pay_dt       = item.get("cashDvdnPayDt", "")
                     if code not in div_map or dvdn_dt > div_map[code]["dvdnBasDt"]:
                         div_map[code] = {
                             "divAmount":     int(div_amt),
@@ -218,7 +253,6 @@ def build_stocks_data():
     _build_status["total"]    = 0
 
     try:
-        today     = today_str()
         base_date = latest_biz_day()
 
         _build_status["step"]     = "한국거래소 시세 조회 중..."
@@ -289,7 +323,7 @@ def build_stocks_data():
                 "divYield":      div_yield,
                 "divAmount":     div_amt,
                 "divPayout":     div_payout,
-                "cashDvdnPayDt": div.get("cashDvdnPayDt", ""),  # 현금배당지급일
+                "cashDvdnPayDt": div.get("cashDvdnPayDt", ""),
             })
 
         save_file_cache(result)
@@ -309,10 +343,8 @@ def build_stocks_data():
 # 매일 오전 7시 자동 빌드 스케줄러
 # =============================================
 def schedule_daily_build():
-    """매일 KST 07:00에 자동으로 데이터 빌드"""
     while True:
         now  = now_kst()
-        # 다음 오전 7시 계산
         next_run = now.replace(hour=7, minute=0, second=0, microsecond=0)
         if now >= next_run:
             next_run += timedelta(days=1)
@@ -325,11 +357,21 @@ def schedule_daily_build():
 # =============================================
 # 엔드포인트
 # =============================================
+
+# ✅ 추가: Warm-up ping 엔드포인트
+@app.route("/ping")
+def ping():
+    """앱에서 주기적으로 호출하여 서버 슬립 방지"""
+    return jsonify({"pong": True, "time": now_kst().isoformat()})
+
 @app.route("/stocks")
 def stocks():
-    cached = load_file_cache()
+    # 1. 유효한 캐시 확인 (72시간 이내)
+    cached = load_file_cache(allow_stale=False)
     if cached:
         return jsonify(cached)
+
+    # 2. 빌드 중이면 진행 상태 반환
     if _build_status["loading"]:
         return jsonify({
             "status":   "loading",
@@ -338,6 +380,16 @@ def stocks():
             "current":  _build_status["current"],
             "total":    _build_status["total"],
         }), 202
+
+    # 3. ✅ 개선: 만료된 캐시라도 즉시 반환하고 백그라운드에서 갱신
+    stale = load_file_cache(allow_stale=True)
+    if stale:
+        print("[CACHE] 만료 캐시 즉시 반환 + 백그라운드 빌드 시작")
+        _build_status["loading"] = True
+        threading.Thread(target=build_stocks_data, daemon=True).start()
+        return jsonify(stale)  # 즉시 응답!
+
+    # 4. 캐시 없음 → 빌드 시작 후 202 반환
     _build_status["loading"] = True
     threading.Thread(target=build_stocks_data, daemon=True).start()
     return jsonify({
@@ -347,7 +399,7 @@ def stocks():
 
 @app.route("/stocks/status")
 def stocks_status():
-    cached = load_file_cache()
+    cached = load_file_cache(allow_stale=False)
     return jsonify({
         "cached":   cached is not None,
         "loading":  _build_status["loading"],
@@ -383,7 +435,6 @@ def kis_get_financial(stock_code):
         return []
 
 def kis_get_investor(stock_code):
-    # 전날 영업일 계산
     now = now_kst()
     prev = now - timedelta(days=1)
     for _ in range(7):
@@ -396,7 +447,7 @@ def kis_get_investor(stock_code):
     params = {
         "FID_COND_MRKT_DIV_CODE": "J",
         "FID_INPUT_ISCD":         stock_code,
-        "FID_INPUT_DATE_1":       prev_date,  # 전날 영업일
+        "FID_INPUT_DATE_1":       prev_date,
     }
     try:
         res    = requests.get(url, headers=kis_headers("FHKST01010900"),
@@ -445,14 +496,13 @@ def health():
     return jsonify({"status": "ok", "date": latest_biz_day()})
 
 # 서버 시작 시: 캐시 없으면 빌드, 스케줄러 항상 실행
-if not load_file_cache():
+if not load_file_cache(allow_stale=True):
     print("[SERVER] 파일 캐시 없음 → 즉시 빌드 시작")
     _build_status["loading"] = True
     threading.Thread(target=build_stocks_data, daemon=True).start()
 else:
     print("[SERVER] 파일 캐시 있음 → 즉시 서비스 가능")
 
-# 매일 오전 7시 자동 빌드 스케줄러
 threading.Thread(target=schedule_daily_build, daemon=True).start()
 
 if __name__ == "__main__":
