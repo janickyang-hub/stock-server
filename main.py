@@ -368,6 +368,7 @@ def build_stocks_data():
                 "id": short_cd, "name": name,
                 "price": price, "change": change,
                 "marketCap": mkt_cap, "capSize": cap_size(mkt_cap),
+                "market": "KOSPI" if item in kospi else "KOSDAQ",  # ✅ 시장 구분
             })
 
         all_items.sort(key=lambda x: x["marketCap"], reverse=True)
@@ -410,6 +411,7 @@ def build_stocks_data():
                 "divAmount":     div_amt,
                 "divPayout":     div_payout,
                 "divFreq":       div_freq,
+                "market":        item["market"],
                 "cashDvdnPayDt": div.get("cashDvdnPayDt", ""),
             })
 
