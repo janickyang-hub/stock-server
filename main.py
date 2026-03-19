@@ -118,6 +118,16 @@ def cap_size(mkt_cap):
     if mkt_cap >= 300_000_000_000:   return "mid"
     return "small"
 
+def common_stock_code(code: str) -> str | None:
+    """
+    우선주 코드 → 보통주 코드 변환
+    한국 우선주는 종목코드 끝자리가 5 (예: 005935 → 005930)
+    변환 불가능하거나 이미 보통주면 None 반환
+    """
+    if len(code) == 6 and code.endswith("5") and code[-2] == "3":
+        return code[:-1] + "0"
+    return None
+
 # =============================================
 # ✅ 개선: 파일 캐시 — 날짜 대신 72시간 TTL 사용
 # =============================================
@@ -247,14 +257,27 @@ def fetch_dividend_map():
                 isin    = item.get("isinCd", "")
                 div_amt = safe_float(item.get("stckGenrDvdnAmt", 0))
                 if len(isin) == 12 and isin.startswith("KR") and div_amt > 0:
-                    code         = isin[3:9]
-                    pay_dt       = item.get("cashDvdnPayDt", "")
-                    if code not in div_map or dvdn_dt > div_map[code]["dvdnBasDt"]:
+                    code   = isin[3:9]
+                    pay_dt = item.get("cashDvdnPayDt", "")
+                    year   = dvdn_dt[:4]  # 배당기준일 연도
+
+                    if code not in div_map:
                         div_map[code] = {
                             "divAmount":     int(div_amt),
                             "dvdnBasDt":     dvdn_dt,
                             "cashDvdnPayDt": pay_dt,
+                            "yearCount":     {},  # ✅ 연도별 배당 횟수
                         }
+                    else:
+                        # 가장 최근 배당 기준일 유지
+                        if dvdn_dt > div_map[code]["dvdnBasDt"]:
+                            div_map[code]["divAmount"]     = int(div_amt)
+                            div_map[code]["dvdnBasDt"]     = dvdn_dt
+                            div_map[code]["cashDvdnPayDt"] = pay_dt
+
+                    # ✅ 연도별 배당 횟수 카운트
+                    yc = div_map[code].setdefault("yearCount", {})
+                    yc[year] = yc.get(year, 0) + 1
             total = int(data.get("response", {}).get("body", {}).get("totalCount", 0))
             print(f"[DEBUG] 배당 page={page}/{(total//1000)+1} 수집={len(div_map)}")
             if page * 1000 >= total:
@@ -267,6 +290,26 @@ def fetch_dividend_map():
         import traceback
         print(f"[ERROR] 배당: {traceback.format_exc()}")
     return div_map
+
+def calc_div_freq(year_count: dict) -> str:
+    """
+    연도별 배당 횟수 딕셔너리로 배당 방식 판단
+    - 가장 많이 관찰된 연간 횟수 기준
+    - 1회 → 연간, 2회 → 반기, 4회 → 분기, 그 외 → 월배당 or 기타
+    """
+    if not year_count:
+        return "연간"
+    # 최근 2년 데이터 기준으로 최빈값 사용
+    counts = sorted(year_count.values(), reverse=True)
+    max_count = counts[0]
+    if max_count >= 10:
+        return "월배당"
+    elif max_count >= 3:
+        return "분기"
+    elif max_count == 2:
+        return "반기"
+    else:
+        return "연간"
 
 def kis_get_per_pbr(stock_code):
     url    = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
@@ -352,6 +395,8 @@ def build_stocks_data():
             div_yield  = round(div_amt / price * 100, 2) if price > 0 and div_amt > 0 else 0.0
             eps        = ind.get("eps", 0)
             div_payout = round(div_amt / eps * 100, 2) if eps > 0 and div_amt > 0 else 0.0
+            # ✅ 배당 방식 계산
+            div_freq   = calc_div_freq(div.get("yearCount", {})) if div_amt > 0 else ""
             result.append({
                 "id":            item["id"],
                 "name":          item["name"],
@@ -364,6 +409,7 @@ def build_stocks_data():
                 "divYield":      div_yield,
                 "divAmount":     div_amt,
                 "divPayout":     div_payout,
+                "divFreq":       div_freq,
                 "cashDvdnPayDt": div.get("cashDvdnPayDt", ""),
             })
 
@@ -581,11 +627,27 @@ def stock_detail(stock_code):
             print(f"[DETAIL] 캐시 반환: {stock_code}")
             return jsonify(cached)
 
-        # 캐시 없으면 실시간 조회 후 저장
+        # ✅ 우선주 여부 확인 — 보통주 코드로 fallback 준비
+        fallback_code = common_stock_code(stock_code)
+
+        financial = kis_get_financial(stock_code)
+        investor  = kis_get_investor(stock_code)
+
+        # ✅ 재무/투자자 데이터가 없고 보통주 코드가 있으면 보통주 데이터 사용
+        if not financial and fallback_code:
+            print(f"[DETAIL] 우선주 {stock_code} 재무 없음 → 보통주 {fallback_code} 조회")
+            financial = kis_get_financial(fallback_code)
+
+        if not investor and fallback_code:
+            print(f"[DETAIL] 우선주 {stock_code} 투자자 없음 → 보통주 {fallback_code} 조회")
+            investor = kis_get_investor(fallback_code)
+
         detail_data = {
-            "code":      stock_code,
-            "financial": kis_get_financial(stock_code),
-            "investor":  kis_get_investor(stock_code),
+            "code":         stock_code,
+            "financial":    financial,
+            "investor":     investor,
+            "isPreferred":  fallback_code is not None,       # ✅ 우선주 여부
+            "commonCode":   fallback_code if fallback_code else "",  # ✅ 보통주 코드
         }
         save_detail_cache(stock_code, detail_data)
         return jsonify(detail_data)
