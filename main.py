@@ -15,12 +15,16 @@ KRX_AUTH_KEY    = "C1421182F8FD42CA999E3F73D51D0DF2C3829272"
 KRX_BASE        = "https://data-dbg.krx.co.kr/svc/apis"
 FSC_SERVICE_KEY = "e0a1fb6fedf17f785d6b35276663fb0f47bb199d21038d494ea05b2250596a30"
 
-KIS_TOP_N  = 500
-KST        = timezone(timedelta(hours=9))
-CACHE_FILE = "/tmp/stocks_cache.json"
+KIS_TOP_N        = 500
+KST              = timezone(timedelta(hours=9))
+CACHE_FILE       = "/tmp/stocks_cache.json"
+DETAIL_CACHE_DIR = "/tmp/detail_cache"   # ✅ 종목별 상세 캐시 디렉토리
+DETAIL_TOP_N     = 100                   # ✅ 초기 빌드 시 상세 데이터 저장 종목 수
 
-# ✅ 개선: 캐시 유효 시간을 72시간으로 설정 (날짜 기반 → 시간 기반)
+# ✅ 서버 캐시 유효 시간 72시간
 CACHE_TTL_HOURS = 72
+
+os.makedirs(DETAIL_CACHE_DIR, exist_ok=True)
 
 _token_cache  = {"access_token": None, "expires_at": None}
 _div_cache    = {"data": None, "date": None}
@@ -169,6 +173,43 @@ def save_file_cache(data):
         print(f"[CACHE] 파일 캐시 저장: {len(data)}개")
     except Exception as e:
         print(f"[CACHE] 파일 캐시 저장 실패: {e}")
+
+# =============================================
+# ✅ 종목별 상세 캐시 저장/로드
+# =============================================
+def save_detail_cache(code, detail_data):
+    """종목 상세 데이터를 /tmp/detail_cache/{code}.json 에 저장"""
+    try:
+        path = os.path.join(DETAIL_CACHE_DIR, f"{code}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({
+                "saved_at": datetime.now(KST).isoformat(),
+                "detail":   detail_data
+            }, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[DETAIL CACHE] 저장 실패 {code}: {e}")
+
+def load_detail_cache(code, allow_stale=False):
+    """종목 상세 캐시 로드 — 당일 자정 이전 저장이면 유효"""
+    try:
+        path = os.path.join(DETAIL_CACHE_DIR, f"{code}.json")
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+        if allow_stale:
+            return cache.get("detail")
+        saved_at = cache.get("saved_at")
+        if saved_at:
+            saved_dt = datetime.fromisoformat(saved_at)
+            # ✅ 오늘 자정(KST 00:00)이 기준 — 당일 저장이면 유효
+            today_midnight = datetime.now(KST).replace(hour=0, minute=0, second=0, microsecond=0)
+            if saved_dt >= today_midnight:
+                return cache.get("detail")
+        return None
+    except Exception as e:
+        print(f"[DETAIL CACHE] 로드 실패 {code}: {e}")
+        return None
 
 # =============================================
 # 배당 API — cashDvdnPayDt 포함
@@ -327,10 +368,39 @@ def build_stocks_data():
             })
 
         save_file_cache(result)
+
+        # ✅ 대형주 상위 DETAIL_TOP_N개 상세 데이터 백그라운드 저장
+        large_caps = [r for r in result if r.get("capSize") == "large"][:DETAIL_TOP_N]
+        print(f"[BUILD] 대형주 상세 데이터 사전 캐싱 시작: {len(large_caps)}개")
+        _build_status["step"] = f"대형주 상세 데이터 저장 중..."
+        saved_count = 0
+        for i, item in enumerate(large_caps):
+            code = item["id"]
+            # 이미 당일 캐시가 있으면 스킵
+            if load_detail_cache(code) is not None:
+                saved_count += 1
+                continue
+            try:
+                detail_data = {
+                    "code":      code,
+                    "financial": kis_get_financial(code),
+                    "investor":  kis_get_investor(code),
+                }
+                save_detail_cache(code, detail_data)
+                saved_count += 1
+                if (i + 1) % 10 == 0:
+                    print(f"[BUILD] 상세 캐시 {i+1}/{len(large_caps)}개 완료")
+                # KIS API 호출 제한 대응 (재무 + 투자자 각 1회씩)
+                if (i + 1) % 18 == 0:
+                    time.sleep(1)
+            except Exception as e:
+                print(f"[BUILD] 상세 캐시 실패 {code}: {e}")
+                continue
+
         _build_status["loading"]  = False
         _build_status["progress"] = 100
         _build_status["step"]     = "완료"
-        print(f"[BUILD] 완료! 총 {len(result)}개")
+        print(f"[BUILD] 완료! 총 {len(result)}개 (상세 캐시 {saved_count}개)")
 
     except Exception as e:
         import traceback
@@ -485,13 +555,27 @@ def kis_get_investor(stock_code):
 @app.route("/stock/<stock_code>/detail")
 def stock_detail(stock_code):
     try:
-        return jsonify({
+        # ✅ 당일 캐시 확인 → 있으면 즉시 반환 (서버 슬립과 무관)
+        cached = load_detail_cache(stock_code)
+        if cached:
+            print(f"[DETAIL] 캐시 반환: {stock_code}")
+            return jsonify(cached)
+
+        # 캐시 없으면 실시간 조회 후 저장
+        detail_data = {
             "code":      stock_code,
             "financial": kis_get_financial(stock_code),
             "investor":  kis_get_investor(stock_code),
-        })
+        }
+        save_detail_cache(stock_code, detail_data)
+        return jsonify(detail_data)
     except Exception as e:
         import traceback
+        # ✅ 실패 시 만료 캐시라도 반환
+        stale = load_detail_cache(stock_code, allow_stale=True)
+        if stale:
+            print(f"[DETAIL] 실패, 만료 캐시 반환: {stock_code}")
+            return jsonify(stale)
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 @app.route("/test_kis")
