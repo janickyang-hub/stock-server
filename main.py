@@ -19,7 +19,7 @@ KIS_TOP_N        = 1000
 KST              = timezone(timedelta(hours=9))
 CACHE_FILE       = "/tmp/stocks_cache.json"
 DETAIL_CACHE_DIR = "/tmp/detail_cache"   # ✅ 종목별 상세 캐시 디렉토리
-DETAIL_TOP_N     = 50                    # ✅ 초기 빌드 시 상세 데이터 저장 종목 수
+DETAIL_TOP_N     = 20                    # ✅ 초기 빌드 시 상세 데이터 저장 종목 수
 
 # ✅ 서버 캐시 유효 시간 72시간
 CACHE_TTL_HOURS = 72
