@@ -607,3 +607,27 @@ threading.Thread(target=schedule_daily_build, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+
+@app.route("/test_financial/<stock_code>")
+def test_financial(stock_code):
+    """재무 API raw 응답 확인용"""
+    results = {}
+    for div_cls in ["0", "1"]:       # 0=연결, 1=별도
+        for mkt in ["J", "Q"]:       # J=KOSPI, Q=KOSDAQ
+            key = f"div={div_cls}_mkt={mkt}"
+            url    = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/finance/income-statement"
+            params = {"FID_DIV_CLS_CODE": div_cls,
+                      "fid_cond_mrkt_div_code": mkt,
+                      "fid_input_iscd": stock_code}
+            try:
+                res = requests.get(url, headers=kis_headers("FHKST66430200"),
+                                   params=params, timeout=10)
+                raw = res.json()
+                results[key] = {
+                    "output_count": len(raw.get("output", [])),
+                    "msg":          raw.get("msg1", ""),
+                    "sample":       raw.get("output", [])[:1]
+                }
+            except Exception as e:
+                results[key] = {"error": str(e)}
+    return jsonify(results)
