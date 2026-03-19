@@ -521,3 +521,32 @@ threading.Thread(target=schedule_daily_build, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+
+@app.route("/test_investor/<stock_code>")
+def test_investor(stock_code):
+    """KIS 투자자 API raw 응답 확인용"""
+    now = now_kst()
+    results = []
+    for days_back in range(1, 6):
+        prev = now - timedelta(days=days_back)
+        if prev.weekday() >= 5:
+            continue
+        prev_date = prev.strftime("%Y%m%d")
+        url    = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-investor"
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD":         stock_code,
+            "FID_INPUT_DATE_1":       prev_date,
+        }
+        try:
+            res  = requests.get(url, headers=kis_headers("FHKST01010900"),
+                                params=params, timeout=10)
+            raw  = res.json()
+            results.append({
+                "date":    prev_date,
+                "status":  res.status_code,
+                "raw":     raw  # 전체 응답 그대로 반환
+            })
+        except Exception as e:
+            results.append({"date": prev_date, "error": str(e)})
+    return jsonify(results)
