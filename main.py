@@ -482,27 +482,47 @@ def stocks_status():
     })
 
 def kis_get_financial(stock_code):
-    url    = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/finance/income-statement"
-    params = {"FID_DIV_CLS_CODE": "0", "fid_cond_mrkt_div_code": "J",
-              "fid_input_iscd": stock_code}
-    try:
-        res    = requests.get(url, headers=kis_headers("FHKST66430200"),
-                              params=params, timeout=10)
-        output = res.json().get("output", [])
-        result = []
-        for item in output[:3]:
-            result.append({
-                "stac_yymm":      item.get("stac_yymm", ""),
-                "sale_account":   safe_float(item.get("sale_account",   0)),
-                "bsop_prti":      safe_float(item.get("bsop_prti",      0)),
-                "net_income":     safe_float(item.get("thtr_ntin",      0)),
-                "sale_totl_prfi": safe_float(item.get("sale_totl_prfi", 0)),
-                "eps":            0.0,
-            })
-        return result
-    except Exception as e:
-        print(f"[ERROR] 재무 {stock_code}: {e}")
-        return []
+    """
+    재무 데이터 조회 — 일반기업 TR 우선, 빈 결과면 금융업 TR 재시도
+    - FHKST66430200: 일반기업 (제조/서비스 등)
+    - FHKST66430300: 은행
+    - FHKST66430400: 금융투자/보험
+    """
+    # TR별 시도 순서: 일반 → 은행 → 보험/금융투자
+    tr_list = ["FHKST66430200", "FHKST66430300", "FHKST66430400"]
+    url     = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/finance/income-statement"
+
+    for tr_id in tr_list:
+        try:
+            params = {"FID_DIV_CLS_CODE": "0", "fid_cond_mrkt_div_code": "J",
+                      "fid_input_iscd": stock_code}
+            res    = requests.get(url, headers=kis_headers(tr_id),
+                                  params=params, timeout=10)
+            output = res.json().get("output", [])
+
+            if not output:
+                print(f"[FINANCIAL] {stock_code} TR={tr_id} 결과 없음, 다음 TR 시도")
+                continue
+
+            result = []
+            for item in output[:3]:
+                result.append({
+                    "stac_yymm":      item.get("stac_yymm", ""),
+                    "sale_account":   safe_float(item.get("sale_account",   0)),
+                    "bsop_prti":      safe_float(item.get("bsop_prti",      0)),
+                    "net_income":     safe_float(item.get("thtr_ntin",      0)),
+                    "sale_totl_prfi": safe_float(item.get("sale_totl_prfi", 0)),
+                    "eps":            0.0,
+                })
+            print(f"[FINANCIAL] {stock_code} TR={tr_id} 성공: {len(result)}개")
+            return result
+
+        except Exception as e:
+            print(f"[ERROR] 재무 {stock_code} TR={tr_id}: {e}")
+            continue
+
+    print(f"[FINANCIAL] {stock_code} 모든 TR 실패 — 재무 데이터 없음")
+    return []
 
 # ✅ 수정: 최근 유효 영업일 자동 탐색 (0 데이터 스킵)
 def kis_get_investor(stock_code):
@@ -607,27 +627,3 @@ threading.Thread(target=schedule_daily_build, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
-
-@app.route("/test_financial/<stock_code>")
-def test_financial(stock_code):
-    """재무 API raw 응답 확인용"""
-    results = {}
-    for div_cls in ["0", "1"]:       # 0=연결, 1=별도
-        for mkt in ["J", "Q"]:       # J=KOSPI, Q=KOSDAQ
-            key = f"div={div_cls}_mkt={mkt}"
-            url    = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/finance/income-statement"
-            params = {"FID_DIV_CLS_CODE": div_cls,
-                      "fid_cond_mrkt_div_code": mkt,
-                      "fid_input_iscd": stock_code}
-            try:
-                res = requests.get(url, headers=kis_headers("FHKST66430200"),
-                                   params=params, timeout=10)
-                raw = res.json()
-                results[key] = {
-                    "output_count": len(raw.get("output", [])),
-                    "msg":          raw.get("msg1", ""),
-                    "sample":       raw.get("output", [])[:1]
-                }
-            except Exception as e:
-                results[key] = {"error": str(e)}
-    return jsonify(results)
