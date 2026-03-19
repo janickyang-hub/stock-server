@@ -383,8 +383,21 @@ def kis_get_financial(stock_code):
         return []
 
 def kis_get_investor(stock_code):
+    # 전날 영업일 계산
+    now = now_kst()
+    prev = now - timedelta(days=1)
+    for _ in range(7):
+        if prev.weekday() < 5:
+            break
+        prev -= timedelta(days=1)
+    prev_date = prev.strftime("%Y%m%d")
+
     url    = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-investor"
-    params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": stock_code}
+    params = {
+        "FID_COND_MRKT_DIV_CODE": "J",
+        "FID_INPUT_ISCD":         stock_code,
+        "FID_INPUT_DATE_1":       prev_date,  # 전날 영업일
+    }
     try:
         res    = requests.get(url, headers=kis_headers("FHKST01010900"),
                               params=params, timeout=10)
