@@ -15,7 +15,7 @@ KRX_AUTH_KEY    = "C1421182F8FD42CA999E3F73D51D0DF2C3829272"
 KRX_BASE        = "https://data-dbg.krx.co.kr/svc/apis"
 FSC_SERVICE_KEY = "e0a1fb6fedf17f785d6b35276663fb0f47bb199d21038d494ea05b2250596a30"
 
-KIS_TOP_N        = 500
+KIS_TOP_N        = 1000
 KST              = timezone(timedelta(hours=9))
 CACHE_FILE       = "/tmp/stocks_cache.json"
 DETAIL_CACHE_DIR = "/tmp/detail_cache"   # ✅ 종목별 상세 캐시 디렉토리
