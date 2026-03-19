@@ -15,9 +15,9 @@ KRX_AUTH_KEY    = "C1421182F8FD42CA999E3F73D51D0DF2C3829272"
 KRX_BASE        = "https://data-dbg.krx.co.kr/svc/apis"
 FSC_SERVICE_KEY = "e0a1fb6fedf17f785d6b35276663fb0f47bb199d21038d494ea05b2250596a30"
 
-KIS_TOP_N    = 500
-KST          = timezone(timedelta(hours=9))
-CACHE_FILE   = "/tmp/stocks_cache.json"   # 파일 캐시 경로
+KIS_TOP_N  = 500
+KST        = timezone(timedelta(hours=9))
+CACHE_FILE = "/tmp/stocks_cache.json"
 
 _token_cache  = {"access_token": None, "expires_at": None}
 _div_cache    = {"data": None, "date": None}
@@ -32,13 +32,11 @@ def now_kst():
 def today_str():
     return now_kst().strftime("%Y%m%d")
 
-def latest_biz_day() -> str:
-    """KRX에 실제 데이터가 있는 가장 최근 영업일 탐색"""
+def latest_biz_day():
     now = now_kst()
-    # 최근 7일 중 데이터 있는 날 탐색
     for i in range(7):
         d = now - timedelta(days=i)
-        if d.weekday() >= 5:  # 주말 제외
+        if d.weekday() >= 5:
             continue
         date_str = d.strftime("%Y%m%d")
         try:
@@ -53,35 +51,7 @@ def latest_biz_day() -> str:
                 return date_str
         except:
             continue
-    # 탐색 실패 시 3일 전 반환
-    d = now - timedelta(days=3)
-    return d.strftime("%Y%m%d")
-    
-# =============================================
-# 파일 캐시 (워커 재시작해도 유지)
-# =============================================
-def load_file_cache():
-    """파일에서 캐시 로드. 오늘 날짜 데이터면 반환."""
-    try:
-        if not os.path.exists(CACHE_FILE):
-            return None
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            cache = json.load(f)
-        if cache.get("date") == today_str() and cache.get("data"):
-            print(f"[CACHE] 파일 캐시 로드: {len(cache['data'])}개")
-            return cache["data"]
-    except Exception as e:
-        print(f"[CACHE] 파일 캐시 로드 실패: {e}")
-    return None
-
-def save_file_cache(data):
-    """데이터를 파일에 저장."""
-    try:
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"date": today_str(), "data": data}, f, ensure_ascii=False)
-        print(f"[CACHE] 파일 캐시 저장: {len(data)}개")
-    except Exception as e:
-        print(f"[CACHE] 파일 캐시 저장 실패: {e}")
+    return (now - timedelta(days=3)).strftime("%Y%m%d")
 
 def get_kis_token():
     now = datetime.now()
@@ -141,6 +111,33 @@ def cap_size(mkt_cap):
     if mkt_cap >= 300_000_000_000:   return "mid"
     return "small"
 
+# =============================================
+# 파일 캐시
+# =============================================
+def load_file_cache():
+    try:
+        if not os.path.exists(CACHE_FILE):
+            return None
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+        if cache.get("date") == today_str() and cache.get("data"):
+            print(f"[CACHE] 파일 캐시 로드: {len(cache['data'])}개")
+            return cache["data"]
+    except Exception as e:
+        print(f"[CACHE] 파일 캐시 로드 실패: {e}")
+    return None
+
+def save_file_cache(data):
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"date": today_str(), "data": data}, f, ensure_ascii=False)
+        print(f"[CACHE] 파일 캐시 저장: {len(data)}개")
+    except Exception as e:
+        print(f"[CACHE] 파일 캐시 저장 실패: {e}")
+
+# =============================================
+# 배당 API — cashDvdnPayDt 포함
+# =============================================
 def fetch_dividend_map():
     today = today_str()
     if _div_cache["data"] is not None and _div_cache["date"] == today:
@@ -174,9 +171,14 @@ def fetch_dividend_map():
                 isin    = item.get("isinCd", "")
                 div_amt = safe_float(item.get("stckGenrDvdnAmt", 0))
                 if len(isin) == 12 and isin.startswith("KR") and div_amt > 0:
-                    code = isin[3:9]
+                    code         = isin[3:9]
+                    pay_dt       = item.get("cashDvdnPayDt", "")  # 현금배당지급일
                     if code not in div_map or dvdn_dt > div_map[code]["dvdnBasDt"]:
-                        div_map[code] = {"divAmount": int(div_amt), "dvdnBasDt": dvdn_dt}
+                        div_map[code] = {
+                            "divAmount":     int(div_amt),
+                            "dvdnBasDt":     dvdn_dt,
+                            "cashDvdnPayDt": pay_dt,
+                        }
             total = int(data.get("response", {}).get("body", {}).get("totalCount", 0))
             print(f"[DEBUG] 배당 page={page}/{(total//1000)+1} 수집={len(div_map)}")
             if page * 1000 >= total:
@@ -205,6 +207,9 @@ def kis_get_per_pbr(stock_code):
     except:
         return {"per": 0, "pbr": 0, "eps": 0}
 
+# =============================================
+# 빌드
+# =============================================
 def build_stocks_data():
     _build_status["loading"]  = True
     _build_status["error"]    = None
@@ -216,20 +221,20 @@ def build_stocks_data():
         today     = today_str()
         base_date = latest_biz_day()
 
-        # 1단계: KRX 시세
         _build_status["step"]     = "한국거래소 시세 조회 중..."
         _build_status["progress"] = 5
         kospi  = krx_post("sto/stk_bydd_trd", {"basDd": base_date})
         kosdaq = krx_post("sto/ksq_bydd_trd", {"basDd": base_date})
         print(f"[BUILD] KRX KOSPI={len(kospi)} KOSDAQ={len(kosdaq)}")
 
-        # 2단계: 배당
+        if not kospi and not kosdaq:
+            raise Exception(f"KRX 데이터 없음 (날짜: {base_date})")
+
         _build_status["step"]     = "배당 정보 수집 중..."
         _build_status["progress"] = 10
         div_map = fetch_dividend_map()
         _build_status["progress"] = 30
 
-        # 3단계: 종목 정렬
         _build_status["step"] = "종목 선별 중..."
         all_items = []
         for item in kospi + kosdaq:
@@ -252,19 +257,17 @@ def build_stocks_data():
         _build_status["total"]    = KIS_TOP_N
         _build_status["progress"] = 35
 
-        # 4단계: KIS PER/PBR — 상위 500개만
         kis_map = {}
         for i, item in enumerate(top_items[:KIS_TOP_N]):
-            _build_status["step"]     = f"투자지표 조회 중... ({i+1}/{KIS_TOP_N})"
-            _build_status["current"]  = i + 1
+            _build_status["step"]    = f"투자지표 조회 중... ({i+1}/{KIS_TOP_N})"
+            _build_status["current"] = i + 1
             _build_status["progress"] = 35 + int((i + 1) / KIS_TOP_N * 65)
-            kis_map[item["id"]]       = kis_get_per_pbr(item["id"])
+            kis_map[item["id"]]      = kis_get_per_pbr(item["id"])
             if (i + 1) % 18 == 0:
                 time.sleep(1)
             if (i + 1) % 100 == 0:
                 print(f"[BUILD] KIS 조회 {i+1}/{KIS_TOP_N}개 완료")
 
-        # 5단계: 결합
         result = []
         for item in top_items:
             ind        = kis_map.get(item["id"], {"per": 0, "pbr": 0, "eps": 0})
@@ -275,22 +278,21 @@ def build_stocks_data():
             eps        = ind.get("eps", 0)
             div_payout = round(div_amt / eps * 100, 2) if eps > 0 and div_amt > 0 else 0.0
             result.append({
-                "id":        item["id"],
-                "name":      item["name"],
-                "price":     price,
-                "change":    item["change"],
-                "marketCap": item["marketCap"],
-                "capSize":   item["capSize"],
-                "per":       ind["per"],
-                "pbr":       ind["pbr"],
-                "divYield":  div_yield,
-                "divAmount": div_amt,
-                "divPayout": div_payout
+                "id":            item["id"],
+                "name":          item["name"],
+                "price":         price,
+                "change":        item["change"],
+                "marketCap":     item["marketCap"],
+                "capSize":       item["capSize"],
+                "per":           ind["per"],
+                "pbr":           ind["pbr"],
+                "divYield":      div_yield,
+                "divAmount":     div_amt,
+                "divPayout":     div_payout,
+                "cashDvdnPayDt": div.get("cashDvdnPayDt", ""),  # 현금배당지급일
             })
 
-        # 파일 캐시에 저장 (워커 재시작 후에도 유지)
         save_file_cache(result)
-
         _build_status["loading"]  = False
         _build_status["progress"] = 100
         _build_status["step"]     = "완료"
@@ -303,14 +305,31 @@ def build_stocks_data():
         _build_status["error"]   = str(e)
         _build_status["step"]    = "오류 발생"
 
+# =============================================
+# 매일 오전 7시 자동 빌드 스케줄러
+# =============================================
+def schedule_daily_build():
+    """매일 KST 07:00에 자동으로 데이터 빌드"""
+    while True:
+        now  = now_kst()
+        # 다음 오전 7시 계산
+        next_run = now.replace(hour=7, minute=0, second=0, microsecond=0)
+        if now >= next_run:
+            next_run += timedelta(days=1)
+        wait_sec = (next_run - now).total_seconds()
+        print(f"[SCHEDULER] 다음 빌드: {next_run.strftime('%Y-%m-%d %H:%M KST')} ({int(wait_sec//3600)}시간 후)")
+        time.sleep(wait_sec)
+        print(f"[SCHEDULER] 오전 7시 자동 빌드 시작")
+        build_stocks_data()
+
+# =============================================
+# 엔드포인트
+# =============================================
 @app.route("/stocks")
 def stocks():
-    # 1순위: 파일 캐시 (워커 재시작 후에도 유지)
     cached = load_file_cache()
     if cached:
         return jsonify(cached)
-
-    # 2순위: 빌드 중
     if _build_status["loading"]:
         return jsonify({
             "status":   "loading",
@@ -319,8 +338,6 @@ def stocks():
             "current":  _build_status["current"],
             "total":    _build_status["total"],
         }), 202
-
-    # 3순위: 빌드 시작
     _build_status["loading"] = True
     threading.Thread(target=build_stocks_data, daemon=True).start()
     return jsonify({
@@ -342,6 +359,61 @@ def stocks_status():
         "error":    _build_status["error"],
     })
 
+def kis_get_financial(stock_code):
+    url    = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/finance/income-statement"
+    params = {"FID_DIV_CLS_CODE": "0", "fid_cond_mrkt_div_code": "J",
+              "fid_input_iscd": stock_code}
+    try:
+        res    = requests.get(url, headers=kis_headers("FHKST66430200"),
+                              params=params, timeout=10)
+        output = res.json().get("output", [])
+        result = []
+        for item in output[:3]:
+            result.append({
+                "stac_yymm":      item.get("stac_yymm", ""),
+                "sale_account":   safe_float(item.get("sale_account",   0)),
+                "bsop_prti":      safe_float(item.get("bsop_prti",      0)),
+                "net_income":     safe_float(item.get("thtr_ntin",      0)),
+                "sale_totl_prfi": safe_float(item.get("sale_totl_prfi", 0)),
+                "eps":            0.0,
+            })
+        return result
+    except Exception as e:
+        print(f"[ERROR] 재무 {stock_code}: {e}")
+        return []
+
+def kis_get_investor(stock_code):
+    url    = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-investor"
+    params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": stock_code}
+    try:
+        res    = requests.get(url, headers=kis_headers("FHKST01010900"),
+                              params=params, timeout=10)
+        output = res.json().get("output", [])
+        result = []
+        for item in output[:1]:
+            result.append({
+                "stck_bsop_date": item.get("stck_bsop_date", ""),
+                "prsn_ntby_qty":  safe_float(item.get("prsn_ntby_qty", 0)),
+                "frgn_ntby_qty":  safe_float(item.get("frgn_ntby_qty", 0)),
+                "orgn_ntby_qty":  safe_float(item.get("orgn_ntby_qty", 0)),
+            })
+        return result
+    except Exception as e:
+        print(f"[ERROR] 투자자 {stock_code}: {e}")
+        return []
+
+@app.route("/stock/<stock_code>/detail")
+def stock_detail(stock_code):
+    try:
+        return jsonify({
+            "code":      stock_code,
+            "financial": kis_get_financial(stock_code),
+            "investor":  kis_get_investor(stock_code),
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
 @app.route("/test_kis")
 def test_kis():
     token = get_kis_token()
@@ -359,95 +431,16 @@ def test_div():
 def health():
     return jsonify({"status": "ok", "date": latest_biz_day()})
 
-# 서버 시작 시: 파일 캐시 없으면 백그라운드 빌드 시작
+# 서버 시작 시: 캐시 없으면 빌드, 스케줄러 항상 실행
 if not load_file_cache():
-    print("[SERVER] 파일 캐시 없음 → 백그라운드 빌드 시작")
+    print("[SERVER] 파일 캐시 없음 → 즉시 빌드 시작")
     _build_status["loading"] = True
     threading.Thread(target=build_stocks_data, daemon=True).start()
 else:
     print("[SERVER] 파일 캐시 있음 → 즉시 서비스 가능")
-    
-@app.route("/debug/<stock_code>")
-def debug_financial(stock_code):
-    url    = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/finance/income-statement"
-    params = {
-        "FID_DIV_CLS_CODE":      "0",   # 0: 연간, 1: 분기
-        "fid_cond_mrkt_div_code": "J",
-        "fid_input_iscd":         stock_code,
-    }
-    res  = requests.get(url, headers=kis_headers("FHKST66430200"),
-                        params=params, timeout=10)
-    return jsonify(res.json())
+
+# 매일 오전 7시 자동 빌드 스케줄러
+threading.Thread(target=schedule_daily_build, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
-
-
-# =============================================
-# 종목 상세 API
-# =============================================
-
-def kis_get_financial(stock_code: str) -> dict:
-    """3년간 연간 실적 (매출, 영업이익, 순이익, EPS) - FHKST66430200"""
-    url    = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/finance/income-statement"
-    params = {
-        "FID_DIV_CLS_CODE": "0",   # 0: 연간
-        "fid_cond_mrkt_div_code": "J",
-        "fid_input_iscd": stock_code,
-    }
-    try:
-        res    = requests.get(url, headers=kis_headers("FHKST66430200"),
-                              params=params, timeout=10)
-        output = res.json().get("output", [])
-        result = []
-        for item in output[:3]:  # 최근 3년
-            result.append({
-                "stac_yymm":   item.get("stac_yymm",   ""),   # 결산년월
-                "sale_account": safe_float(item.get("sale_account", 0)),  # 매출액
-                "bsop_prti":        safe_float(item.get("bsop_prti",        0)),  # 영업이익
-                "net_income":       safe_float(item.get("thtr_ntin",        0)),  # 당기순이익
-                "sale_totl_prfi":   safe_float(item.get("sale_totl_prfi",   0)),  # 매출총이익
-                "eps":              0.0,  # KIS API 미제공
-            })
-        return result
-    except Exception as e:
-        print(f"[ERROR] 재무 {stock_code}: {e}")
-        return []
-
-def kis_get_investor(stock_code: str) -> dict:
-    """전일 투자자별 매매 수량 - FHKST01010900"""
-    url    = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-investor"
-    params = {
-        "FID_COND_MRKT_DIV_CODE": "J",
-        "FID_INPUT_ISCD":         stock_code,
-    }
-    try:
-        res    = requests.get(url, headers=kis_headers("FHKST01010900"),
-                              params=params, timeout=10)
-        output = res.json().get("output", [])
-        result = []
-        for item in output[:1]:  # 전일 데이터
-            result.append({
-                "stck_bsop_date": item.get("stck_bsop_date", ""),  # 날짜
-                "prsn_ntby_qty":  safe_float(item.get("prsn_ntby_qty", 0)),   # 개인 순매수
-                "frgn_ntby_qty":  safe_float(item.get("frgn_ntby_qty", 0)),   # 외국인 순매수
-                "orgn_ntby_qty":  safe_float(item.get("orgn_ntby_qty", 0)),   # 기관 순매수
-            })
-        return result
-    except Exception as e:
-        print(f"[ERROR] 투자자 {stock_code}: {e}")
-        return []
-
-@app.route("/stock/<stock_code>/detail")
-def stock_detail(stock_code: str):
-    try:
-        financial = kis_get_financial(stock_code)
-        investor  = kis_get_investor(stock_code)
-        return jsonify({
-            "code":      stock_code,
-            "financial": financial,
-            "investor":  investor,
-        })
-    except Exception as e:
-        import traceback
-        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
