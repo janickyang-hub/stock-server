@@ -118,13 +118,32 @@ def cap_size(mkt_cap):
     if mkt_cap >= 300_000_000_000:   return "mid"
     return "small"
 
-def common_stock_code(code: str) -> str | None:
+def is_preferred_stock(code: str, name: str = "") -> bool:
+    """
+    우선주 여부 판별
+    1. 종목명에 '우' 포함 (삼성전자우, 삼성물산우B, LG화학우 등)
+    2. 종목코드 끝자리가 5 (대부분의 우선주 패턴)
+    단, 종목명 끝이 '우' 이거나 '우' + 알파벳으로 끝나는 경우
+    """
+    import re
+    if name:
+        # 종목명이 '우' 또는 '우B', '우C' 등으로 끝나는 경우
+        if re.search(r'우[A-Z]?$', name):
+            return True
+    # 코드 끝자리 5 패턴 (보조 조건)
+    if len(code) == 6 and code.endswith("5"):
+        return True
+    return False
+
+def common_stock_code(code: str, name: str = "") -> str | None:
     """
     우선주 코드 → 보통주 코드 변환
-    한국 우선주는 종목코드 끝자리가 5 (예: 005935 → 005930)
-    변환 불가능하거나 이미 보통주면 None 반환
+    - 종목코드 끝자리 5 → 0으로 변환 (예: 005935 → 005930)
+    - 우선주가 아니면 None 반환
     """
-    if len(code) == 6 and code.endswith("5") and code[-2] == "3":
+    if not is_preferred_stock(code, name):
+        return None
+    if len(code) == 6 and code.endswith("5"):
         return code[:-1] + "0"
     return None
 
@@ -455,14 +474,17 @@ def prefetch_detail_cache(large_caps):
             saved_count += 1
             continue
         try:
-            fallback = common_stock_code(code)
+            name     = item.get("name", "")
+            fallback = common_stock_code(code, name)  # ✅ 종목명도 함께 전달
             financial = kis_get_financial(code)
             investor  = kis_get_investor(code)
 
             # 우선주면 보통주 데이터로 보완
             if not financial and fallback:
+                print(f"[PREFETCH] 우선주 {code}({name}) 재무 없음 → 보통주 {fallback} 조회")
                 financial = kis_get_financial(fallback)
             if not investor and fallback:
+                print(f"[PREFETCH] 우선주 {code}({name}) 투자자 없음 → 보통주 {fallback} 조회")
                 investor  = kis_get_investor(fallback)
 
             detail_data = {
@@ -660,8 +682,16 @@ def stock_detail(stock_code):
             print(f"[DETAIL] 캐시 반환: {stock_code}")
             return jsonify(cached)
 
-        # ✅ 우선주 여부 확인 — 보통주 코드로 fallback 준비
-        fallback_code = common_stock_code(stock_code)
+        # ✅ 종목명 조회 (캐시에서) → 우선주 판별 정확도 향상
+        stock_name = ""
+        cached_list = load_file_cache(allow_stale=True)
+        if cached_list:
+            matched = next((s for s in cached_list if s.get("id") == stock_code), None)
+            if matched:
+                stock_name = matched.get("name", "")
+
+        fallback_code = common_stock_code(stock_code, stock_name)  # ✅ 종목명 함께 전달
+        print(f"[DETAIL] {stock_code}({stock_name}) 우선주여부={fallback_code is not None} fallback={fallback_code}")
 
         financial = kis_get_financial(stock_code)
         investor  = kis_get_investor(stock_code)
