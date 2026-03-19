@@ -434,37 +434,51 @@ def kis_get_financial(stock_code):
         print(f"[ERROR] 재무 {stock_code}: {e}")
         return []
 
+# ✅ 수정: 최근 유효 영업일 자동 탐색 (0 데이터 스킵)
 def kis_get_investor(stock_code):
     now = now_kst()
-    prev = now - timedelta(days=1)
-    for _ in range(7):
-        if prev.weekday() < 5:
-            break
-        prev -= timedelta(days=1)
-    prev_date = prev.strftime("%Y%m%d")
 
-    url    = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-investor"
-    params = {
-        "FID_COND_MRKT_DIV_CODE": "J",
-        "FID_INPUT_ISCD":         stock_code,
-        "FID_INPUT_DATE_1":       prev_date,
-    }
-    try:
-        res    = requests.get(url, headers=kis_headers("FHKST01010900"),
-                              params=params, timeout=10)
-        output = res.json().get("output", [])
-        result = []
-        for item in output[:1]:
-            result.append({
-                "stck_bsop_date": item.get("stck_bsop_date", ""),
-                "prsn_ntby_qty":  safe_float(item.get("prsn_ntby_qty", 0)),
-                "frgn_ntby_qty":  safe_float(item.get("frgn_ntby_qty", 0)),
-                "orgn_ntby_qty":  safe_float(item.get("orgn_ntby_qty", 0)),
-            })
-        return result
-    except Exception as e:
-        print(f"[ERROR] 투자자 {stock_code}: {e}")
-        return []
+    for days_back in range(1, 8):
+        prev = now - timedelta(days=days_back)
+        if prev.weekday() >= 5:  # 주말 스킵
+            continue
+        prev_date = prev.strftime("%Y%m%d")
+
+        url    = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-investor"
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD":         stock_code,
+            "FID_INPUT_DATE_1":       prev_date,
+        }
+        try:
+            res    = requests.get(url, headers=kis_headers("FHKST01010900"),
+                                  params=params, timeout=10)
+            output = res.json().get("output", [])
+
+            # ✅ 하나라도 0이 아닌 값이 있는 날짜만 사용
+            valid = [
+                item for item in output[:1]
+                if any(safe_float(item.get(k, 0)) != 0
+                       for k in ["prsn_ntby_qty", "frgn_ntby_qty", "orgn_ntby_qty"])
+            ]
+            if valid:
+                item = valid[0]
+                print(f"[DEBUG] 투자자 {stock_code} 유효 날짜: {prev_date}")
+                return [{
+                    "stck_bsop_date": item.get("stck_bsop_date", prev_date),
+                    "prsn_ntby_qty":  safe_float(item.get("prsn_ntby_qty", 0)),
+                    "frgn_ntby_qty":  safe_float(item.get("frgn_ntby_qty", 0)),
+                    "orgn_ntby_qty":  safe_float(item.get("orgn_ntby_qty", 0)),
+                }]
+            else:
+                print(f"[DEBUG] 투자자 {stock_code} {prev_date} 데이터 없음, 이전 날짜 시도")
+
+        except Exception as e:
+            print(f"[ERROR] 투자자 {stock_code} ({prev_date}): {e}")
+            continue
+
+    print(f"[WARN] 투자자 {stock_code} 유효 데이터 없음")
+    return []
 
 @app.route("/stock/<stock_code>/detail")
 def stock_detail(stock_code):
