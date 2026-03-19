@@ -708,15 +708,26 @@ def test_div():
 def health():
     return jsonify({"status": "ok", "date": latest_biz_day()})
 
-# 서버 시작 시: 캐시 없으면 빌드, 스케줄러 항상 실행
-if not load_file_cache(allow_stale=True):
-    print("[SERVER] 파일 캐시 없음 → 즉시 빌드 시작")
-    _build_status["loading"] = True
-    threading.Thread(target=build_stocks_data, daemon=True).start()
-else:
-    print("[SERVER] 파일 캐시 있음 → 즉시 서비스 가능")
+# =============================================
+# 서버 초기화 — Flask 앱 바인딩 후 실행
+# =============================================
+def on_server_start():
+    """gunicorn worker 또는 직접 실행 시 Flask 바인딩 완료 후 호출"""
+    if not load_file_cache(allow_stale=True):
+        print("[SERVER] 파일 캐시 없음 → 즉시 빌드 시작")
+        _build_status["loading"] = True
+        threading.Thread(target=build_stocks_data, daemon=True).start()
+    else:
+        print("[SERVER] 파일 캐시 있음 → 즉시 서비스 가능")
+    threading.Thread(target=schedule_daily_build, daemon=True).start()
 
-threading.Thread(target=schedule_daily_build, daemon=True).start()
+# gunicorn으로 실행 시: worker가 포크된 후 초기화
+# (모듈 임포트 시점이 아닌 실제 worker 준비 완료 후 실행)
+import os as _os
+if _os.environ.get("GUNICORN_WORKER_INIT") == "1" or __name__ != "__main__":
+    # 짧은 딜레이 후 초기화 (Flask 바인딩 완료 보장)
+    threading.Timer(2.0, on_server_start).start()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    on_server_start()
+    app.run(host="0.0.0.0", port=int(_os.environ.get("PORT", 10000)))
