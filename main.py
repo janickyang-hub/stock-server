@@ -371,7 +371,7 @@ def build_stocks_data():
             })
 
         all_items.sort(key=lambda x: x["marketCap"], reverse=True)
-        top_items = all_items[:2000]
+        top_items = all_items[:1000]
         _build_status["total"]    = KIS_TOP_N
         _build_status["progress"] = 35
 
