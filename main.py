@@ -19,7 +19,7 @@ KIS_TOP_N        = 500
 KST              = timezone(timedelta(hours=9))
 CACHE_FILE       = "/tmp/stocks_cache.json"
 DETAIL_CACHE_DIR = "/tmp/detail_cache"   # ✅ 종목별 상세 캐시 디렉토리
-DETAIL_TOP_N     = 50                   # ✅ 초기 빌드 시 상세 데이터 저장 종목 수
+DETAIL_TOP_N     = 50                    # ✅ 초기 빌드 시 상세 데이터 저장 종목 수
 
 # ✅ 서버 캐시 유효 시간 72시간
 CACHE_TTL_HOURS = 72
@@ -415,38 +415,19 @@ def build_stocks_data():
 
         save_file_cache(result)
 
-        # ✅ 대형주 상위 DETAIL_TOP_N개 상세 데이터 백그라운드 저장
-        large_caps = [r for r in result if r.get("capSize") == "large"][:DETAIL_TOP_N]
-        print(f"[BUILD] 대형주 상세 데이터 사전 캐싱 시작: {len(large_caps)}개")
-        _build_status["step"] = f"대형주 상세 데이터 저장 중..."
-        saved_count = 0
-        for i, item in enumerate(large_caps):
-            code = item["id"]
-            # 이미 당일 캐시가 있으면 스킵
-            if load_detail_cache(code) is not None:
-                saved_count += 1
-                continue
-            try:
-                detail_data = {
-                    "code":      code,
-                    "financial": kis_get_financial(code),
-                    "investor":  kis_get_investor(code),
-                }
-                save_detail_cache(code, detail_data)
-                saved_count += 1
-                if (i + 1) % 10 == 0:
-                    print(f"[BUILD] 상세 캐시 {i+1}/{len(large_caps)}개 완료")
-                # KIS API 호출 제한 대응 (재무 + 투자자 각 1회씩)
-                if (i + 1) % 18 == 0:
-                    time.sleep(1)
-            except Exception as e:
-                print(f"[BUILD] 상세 캐시 실패 {code}: {e}")
-                continue
-
+        # ✅ 메인 빌드 먼저 완료 선언 — 앱이 즉시 데이터 수신 가능
         _build_status["loading"]  = False
         _build_status["progress"] = 100
         _build_status["step"]     = "완료"
-        print(f"[BUILD] 완료! 총 {len(result)}개 (상세 캐시 {saved_count}개)")
+        print(f"[BUILD] 완료! 총 {len(result)}개")
+
+        # ✅ 상세 캐싱은 별도 스레드에서 진행 (Render 타임아웃 방지)
+        large_caps = [r for r in result if r.get("capSize") == "large"][:DETAIL_TOP_N]
+        threading.Thread(
+            target=prefetch_detail_cache,
+            args=(large_caps,),
+            daemon=True
+        ).start()
 
     except Exception as e:
         import traceback
@@ -454,6 +435,56 @@ def build_stocks_data():
         _build_status["loading"] = False
         _build_status["error"]   = str(e)
         _build_status["step"]    = "오류 발생"
+
+# =============================================
+# ✅ 상세 캐시 사전 저장 (별도 스레드 — 메인 빌드와 분리)
+# =============================================
+def prefetch_detail_cache(large_caps):
+    """
+    대형주 상위 N개 상세 데이터를 백그라운드에서 순차 저장
+    메인 빌드 완료 후 별도 스레드에서 실행되므로 Render 타임아웃 영향 없음
+    """
+    print(f"[PREFETCH] 상세 캐시 시작: {len(large_caps)}개")
+    saved_count = 0
+    for i, item in enumerate(large_caps):
+        code = item["id"]
+        # 이미 당일 캐시가 있으면 스킵
+        if load_detail_cache(code) is not None:
+            saved_count += 1
+            continue
+        try:
+            fallback = common_stock_code(code)
+            financial = kis_get_financial(code)
+            investor  = kis_get_investor(code)
+
+            # 우선주면 보통주 데이터로 보완
+            if not financial and fallback:
+                financial = kis_get_financial(fallback)
+            if not investor and fallback:
+                investor  = kis_get_investor(fallback)
+
+            detail_data = {
+                "code":        code,
+                "financial":   financial,
+                "investor":    investor,
+                "isPreferred": fallback is not None,
+                "commonCode":  fallback if fallback else "",
+            }
+            save_detail_cache(code, detail_data)
+            saved_count += 1
+
+            if (i + 1) % 10 == 0:
+                print(f"[PREFETCH] 상세 캐시 {i+1}/{len(large_caps)}개 완료")
+
+            # KIS API 호출 제한 대응 — 18회마다 1초 대기
+            if (i + 1) % 18 == 0:
+                time.sleep(1)
+
+        except Exception as e:
+            print(f"[PREFETCH] 실패 {code}: {e}")
+            continue
+
+    print(f"[PREFETCH] 완료: {saved_count}/{len(large_caps)}개 저장")
 
 # =============================================
 # 매일 오전 7시 자동 빌드 스케줄러
