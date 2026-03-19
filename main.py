@@ -455,23 +455,25 @@ def kis_get_investor(stock_code):
                                   params=params, timeout=10)
             output = res.json().get("output", [])
 
-            # ✅ 하나라도 0이 아닌 값이 있는 날짜만 사용
-            valid = [
-                item for item in output[:1]
-                if any(safe_float(item.get(k, 0)) != 0
-                       for k in ["prsn_ntby_qty", "frgn_ntby_qty", "orgn_ntby_qty"])
-            ]
+            # ✅ output 전체를 순회하며 빈 값이 아닌 첫 번째 항목 탐색
+            # (output[0]은 항상 오늘 날짜이며 값이 빈 문자열""로 채워짐)
+            valid = None
+            for row in output:
+                if any(str(row.get(k, "")).strip() not in ("", "0")
+                       for k in ["prsn_ntby_qty", "frgn_ntby_qty", "orgn_ntby_qty"]):
+                    valid = row
+                    break
+
             if valid:
-                item = valid[0]
-                print(f"[DEBUG] 투자자 {stock_code} 유효 날짜: {prev_date}")
+                print(f"[DEBUG] 투자자 {stock_code} 유효 날짜: {valid.get('stck_bsop_date', prev_date)}")
                 return [{
-                    "stck_bsop_date": item.get("stck_bsop_date", prev_date),
-                    "prsn_ntby_qty":  safe_float(item.get("prsn_ntby_qty", 0)),
-                    "frgn_ntby_qty":  safe_float(item.get("frgn_ntby_qty", 0)),
-                    "orgn_ntby_qty":  safe_float(item.get("orgn_ntby_qty", 0)),
+                    "stck_bsop_date": valid.get("stck_bsop_date", prev_date),
+                    "prsn_ntby_qty":  safe_float(valid.get("prsn_ntby_qty", 0)),
+                    "frgn_ntby_qty":  safe_float(valid.get("frgn_ntby_qty", 0)),
+                    "orgn_ntby_qty":  safe_float(valid.get("orgn_ntby_qty", 0)),
                 }]
             else:
-                print(f"[DEBUG] 투자자 {stock_code} {prev_date} 데이터 없음, 이전 날짜 시도")
+                print(f"[DEBUG] 투자자 {stock_code} {prev_date} 전체 output 빈 값, 이전 날짜 시도")
 
         except Exception as e:
             print(f"[ERROR] 투자자 {stock_code} ({prev_date}): {e}")
@@ -521,32 +523,3 @@ threading.Thread(target=schedule_daily_build, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
-
-@app.route("/test_investor/<stock_code>")
-def test_investor(stock_code):
-    """KIS 투자자 API raw 응답 확인용"""
-    now = now_kst()
-    results = []
-    for days_back in range(1, 6):
-        prev = now - timedelta(days=days_back)
-        if prev.weekday() >= 5:
-            continue
-        prev_date = prev.strftime("%Y%m%d")
-        url    = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-investor"
-        params = {
-            "FID_COND_MRKT_DIV_CODE": "J",
-            "FID_INPUT_ISCD":         stock_code,
-            "FID_INPUT_DATE_1":       prev_date,
-        }
-        try:
-            res  = requests.get(url, headers=kis_headers("FHKST01010900"),
-                                params=params, timeout=10)
-            raw  = res.json()
-            results.append({
-                "date":    prev_date,
-                "status":  res.status_code,
-                "raw":     raw  # 전체 응답 그대로 반환
-            })
-        except Exception as e:
-            results.append({"date": prev_date, "error": str(e)})
-    return jsonify(results)
