@@ -400,7 +400,11 @@ def build_stocks_data():
             _build_status["step"]    = f"투자지표 조회 중... ({i+1}/{KIS_TOP_N})"
             _build_status["current"] = i + 1
             _build_status["progress"] = 35 + int((i + 1) / KIS_TOP_N * 65)
-            kis_map[item["id"]]      = kis_get_per_pbr(item["id"])
+            code     = item["id"]
+            name     = item["name"]
+            # ✅ 우선주면 보통주 코드로 PER/PBR 조회
+            query_code = common_stock_code(code, name) or code
+            kis_map[code] = kis_get_per_pbr(query_code)
             if (i + 1) % 18 == 0:
                 time.sleep(1)
             if (i + 1) % 100 == 0:
@@ -408,10 +412,21 @@ def build_stocks_data():
 
         result = []
         for item in top_items:
-            ind        = kis_map.get(item["id"], {"per": 0, "pbr": 0, "eps": 0})
-            div        = div_map.get(item["id"], {})
+            code       = item["id"]
+            name       = item["name"]
             price      = item["price"]
+            ind        = kis_map.get(code, {"per": 0, "pbr": 0, "eps": 0})
+
+            # ✅ 우선주면 배당 데이터도 보통주에서 fallback
+            common_code = common_stock_code(code, name)
+            div = div_map.get(code, {})
+            if not div and common_code:
+                div = div_map.get(common_code, {})
+                if div:
+                    print(f"[BUILD] 우선주 {code}({name}) 배당 없음 → 보통주 {common_code} 배당 사용")
+
             div_amt    = div.get("divAmount", 0)
+            # ✅ 배당수익률은 우선주 현재가로 계산 (보통주 배당액 / 우선주 현재가)
             div_yield  = round(div_amt / price * 100, 2) if price > 0 and div_amt > 0 else 0.0
             eps        = ind.get("eps", 0)
             div_payout = round(div_amt / eps * 100, 2) if eps > 0 and div_amt > 0 else 0.0
