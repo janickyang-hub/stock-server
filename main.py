@@ -586,6 +586,17 @@ def stocks():
 @app.route("/stocks/status")
 def stocks_status():
     cached = load_file_cache(allow_stale=False)
+
+    # ✅ 캐시 저장 시각 반환 (앱에서 당일 캐시 여부 판단용)
+    saved_at = None
+    try:
+        if os.path.exists(CACHE_FILE):
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            saved_at = raw.get("saved_at")
+    except:
+        pass
+
     return jsonify({
         "cached":   cached is not None,
         "loading":  _build_status["loading"],
@@ -595,6 +606,7 @@ def stocks_status():
         "total":    _build_status["total"],
         "count":    len(cached) if cached else 0,
         "error":    _build_status["error"],
+        "savedAt":  saved_at,  # ✅ 캐시 저장 시각 (ISO 형식)
     })
 
 def kis_get_financial(stock_code):
